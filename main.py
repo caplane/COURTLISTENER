@@ -247,7 +247,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                         "q": keyword_query,  # No quotes = keyword search
                         "type": "o",
                         "order_by": "dateFiled asc",
-                        "page_size": limit
+                        "page_size": 30  # Cast wider net for OCR'd historical docs
                     }
                     
                     response = await client.get(search_url, headers=headers, params=params_fallback)
@@ -256,7 +256,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                     
                     logger.info(f"Keyword fallback result count: {data.get('count', 0)}")
                     
-                    for item in data.get("results", [])[:limit]:
+                    for item in data.get("results", [])[:30]:
                         cluster_id = str(item.get("cluster_id", ""))
                         court_raw = item.get("court", "")
                         court_parts = court_raw.split("/") if court_raw else []
