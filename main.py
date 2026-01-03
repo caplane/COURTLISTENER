@@ -218,8 +218,76 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 logger.info(f"Found: {item.get('caseName', 'Unknown')} - {citation}")
             
+            # FALLBACK: If phrase search returns 0 results, try keyword search
+            # This handles OCR'd historical documents where exact phrase won't match
             if not results:
-                logger.info("No results found in search")
+                logger.info("Phrase search returned 0 results, trying keyword fallback...")
+                
+                # Extract distinctive keywords (nouns, numbers, uncommon words)
+                # Remove common words and keep distinctive terms
+                stop_words = {'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or', 'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with', 'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no', 'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when', 'where', 'why', 'how'}
+                
+                # Get more text for keyword extraction (first 150 chars)
+                keyword_source = quote_text[:150].lower()
+                # Remove punctuation except numbers
+                keyword_source = re.sub(r'[^\w\s]', ' ', keyword_source)
+                words = keyword_source.split()
+                
+                # Keep distinctive words (not stop words, length > 2)
+                keywords = [w for w in words if w not in stop_words and len(w) > 2]
+                
+                # Take first 6-8 distinctive keywords
+                keywords = keywords[:8]
+                
+                if keywords:
+                    keyword_query = ' '.join(keywords)
+                    logger.info(f"Keyword fallback query: {keyword_query}")
+                    
+                    params_fallback = {
+                        "q": keyword_query,  # No quotes = keyword search
+                        "type": "o",
+                        "order_by": "dateFiled asc",
+                        "page_size": limit
+                    }
+                    
+                    response = await client.get(search_url, headers=headers, params=params_fallback)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    logger.info(f"Keyword fallback result count: {data.get('count', 0)}")
+                    
+                    for item in data.get("results", [])[:limit]:
+                        cluster_id = str(item.get("cluster_id", ""))
+                        court_raw = item.get("court", "")
+                        court_parts = court_raw.split("/") if court_raw else []
+                        court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
+                        court_name = COURT_NAME_MAP.get(court_id, court_id)
+                        
+                        citation = ""
+                        if item.get("citation"):
+                            citation = item.get("citation", [""])[0] if isinstance(item.get("citation"), list) else item.get("citation", "")
+                        
+                        snippet = ""
+                        if item.get("snippet"):
+                            snippet = item.get("snippet", "")
+                        elif item.get("text"):
+                            snippet = item.get("text", "")[:500]
+                        
+                        results.append(SearchResult(
+                            success=True,
+                            case_name=item.get("caseName", item.get("case_name", "")),
+                            citation=citation,
+                            court=court_name,
+                            date_filed=item.get("dateFiled", item.get("date_filed", "")),
+                            snippet=snippet,
+                            url=f"https://www.courtlistener.com/opinion/{cluster_id}/",
+                            cluster_id=cluster_id
+                        ))
+                        
+                        logger.info(f"Found (keyword): {item.get('caseName', 'Unknown')} - {citation}")
+            
+            if not results:
+                logger.info("No results found in search (phrase + keyword fallback)")
                 
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
