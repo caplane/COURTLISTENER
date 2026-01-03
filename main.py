@@ -25,21 +25,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 
-# NER support - graceful fallback if not available
-try:
-    import spacy
-    try:
-        nlp = spacy.load("en_core_web_sm")
-        NER_AVAILABLE = True
-        logging.info("spaCy NER loaded successfully")
-    except OSError:
-        NER_AVAILABLE = False
-        nlp = None
-        logging.warning("spaCy model not found - using fallback keyword extraction")
-except ImportError:
-    NER_AVAILABLE = False
-    nlp = None
-    logging.warning("spaCy not installed - using fallback keyword extraction")
+# NER disabled - using regex-based extraction instead
+NER_AVAILABLE = False
+nlp = None
 
 # =============================================================================
 # LOGGING SETUP
