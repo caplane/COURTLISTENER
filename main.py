@@ -137,14 +137,19 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
         "Content-Type": "application/json"
     }
     
-    # Use first 150 chars for search
+    # Extract keywords: truncate at word boundary (max ~150 chars)
     search_text = quote_text[:150].strip()
+    if len(quote_text) > 150:
+        # Truncate at last space to avoid mid-word cutoff
+        last_space = search_text.rfind(' ')
+        if last_space > 50:  # Only if we keep a reasonable amount
+            search_text = search_text[:last_space]
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             search_url = f"{COURTLISTENER_BASE_URL}/search/"
             params = {
-                "q": f'"{search_text}"',
+                "q": search_text,  # Keyword search, not exact phrase
                 "type": "o",  # Opinions
                 "order_by": "score desc",
                 "page_size": limit
