@@ -25,6 +25,22 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import httpx
 
+# NER support - graceful fallback if not available
+try:
+    import spacy
+    try:
+        nlp = spacy.load("en_core_web_sm")
+        NER_AVAILABLE = True
+        logging.info("spaCy NER loaded successfully")
+    except OSError:
+        NER_AVAILABLE = False
+        nlp = None
+        logging.warning("spaCy model not found - using fallback keyword extraction")
+except ImportError:
+    NER_AVAILABLE = False
+    nlp = None
+    logging.warning("spaCy not installed - using fallback keyword extraction")
+
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
@@ -105,6 +121,91 @@ class SearchRequest(BaseModel):
 
 class CitationRequest(BaseModel):
     citation: str
+
+# =============================================================================
+# NER-BASED KEYWORD EXTRACTION
+# =============================================================================
+
+def extract_keywords_ner(text: str, max_keywords: int = 10) -> List[str]:
+    """
+    Extract distinctive keywords using NER + fallback.
+    
+    Priority:
+    1. Named entities (PERSON, ORG, GPE, FAC, PRODUCT, EVENT, WORK_OF_ART)
+    2. Dates and numbers (especially years)
+    3. Distinctive nouns (filtered by stop words)
+    
+    Returns list of keywords for search query.
+    """
+    keywords = []
+    seen = set()
+    
+    # Stop words for fallback extraction
+    stop_words = {
+        # Common English
+        'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or', 'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with', 'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no', 'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when', 'where', 'why', 'how', 'out', 'against', 'into', 'upon', 'under', 'over', 'between', 'through', 'during', 'before', 'after', 'above', 'below', 'such', 'other', 'same', 'only', 'own', 'more', 'most', 'some', 'also', 'just', 'even', 'both', 'either', 'neither', 'whether', 'while', 'although', 'because', 'since', 'unless', 'until', 'however', 'therefore', 'thus', 'hence', 'there', 'here', 'now', 'still', 'yet', 'already', 'always', 'never', 'ever', 'often', 'sometimes', 'usually', 'again', 'further', 'once', 'twice',
+        # Common legal terms (appear in nearly every case)
+        'action', 'commenced', 'plaintiff', 'defendant', 'appellee', 'appellant', 'court', 'case', 'matter', 'cause', 'suit', 'claim', 'filed', 'brought', 'sued', 'recover', 'damages', 'judgment', 'order', 'decree', 'held', 'found', 'decided', 'ruled', 'affirmed', 'reversed', 'remanded', 'denied', 'granted', 'motion', 'petition', 'complaint', 'answer', 'issue', 'question', 'fact', 'law', 'evidence', 'testimony', 'witness', 'trial', 'hearing', 'proceeding', 'party', 'parties', 'person', 'persons', 'belonging', 'said', 'made', 'given', 'done', 'taken'
+    }
+    
+    def add_keyword(word: str):
+        """Add keyword if not duplicate."""
+        word_lower = word.lower().strip()
+        if word_lower and word_lower not in seen and len(word_lower) > 2:
+            keywords.append(word_lower)
+            seen.add(word_lower)
+    
+    # Try NER extraction first
+    if NER_AVAILABLE and nlp:
+        try:
+            doc = nlp(text[:500])  # Limit text length for performance
+            
+            # Priority 1: Named entities
+            priority_labels = {'PERSON', 'ORG', 'GPE', 'FAC', 'PRODUCT', 'EVENT', 'WORK_OF_ART', 'LOC'}
+            for ent in doc.ents:
+                if ent.label_ in priority_labels:
+                    # Add each word of multi-word entities
+                    for word in ent.text.split():
+                        if word.lower() not in stop_words:
+                            add_keyword(word)
+            
+            # Priority 2: Dates and numbers (especially 4-digit years)
+            for ent in doc.ents:
+                if ent.label_ in {'DATE', 'CARDINAL', 'MONEY', 'QUANTITY'}:
+                    # Extract just numbers/years
+                    numbers = re.findall(r'\b\d{4}\b|\b\d+\b', ent.text)
+                    for num in numbers:
+                        add_keyword(num)
+            
+            # Priority 3: Concrete nouns (not in stop words)
+            for token in doc:
+                if token.pos_ in {'NOUN', 'PROPN'} and token.text.lower() not in stop_words:
+                    add_keyword(token.text)
+                    
+            logger.info(f"NER extracted {len(keywords)} keywords: {keywords[:10]}")
+            
+        except Exception as e:
+            logger.warning(f"NER extraction failed: {e}, falling back to regex")
+            keywords = []
+            seen = set()
+    
+    # Fallback: regex-based extraction if NER didn't produce enough
+    if len(keywords) < max_keywords:
+        # Extract 4-digit years first (very distinctive)
+        years = re.findall(r'\b(1[0-9]{3}|20[0-2][0-9])\b', text)
+        for year in years:
+            add_keyword(year)
+        
+        # Extract remaining distinctive words
+        text_clean = re.sub(r'[^\w\s]', ' ', text[:300].lower())
+        words = text_clean.split()
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                add_keyword(word)
+    
+    result = keywords[:max_keywords]
+    logger.info(f"Final keywords ({len(result)}): {result}")
+    return result
 
 # =============================================================================
 # CORE FUNCTIONS
@@ -221,28 +322,10 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
             # FALLBACK: If phrase search returns 0 results, try keyword search
             # This handles OCR'd historical documents where exact phrase won't match
             if not results:
-                logger.info("Phrase search returned 0 results, trying keyword fallback...")
+                logger.info("Phrase search returned 0 results, trying NER-based keyword fallback...")
                 
-                # Extract distinctive keywords (nouns, numbers, uncommon words)
-                # Remove common words and keep distinctive terms
-                stop_words = {
-                    # Common English
-                    'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or', 'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with', 'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no', 'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when', 'where', 'why', 'how', 'out', 'against', 'into', 'upon', 'under', 'over', 'between', 'through', 'during', 'before', 'after', 'above', 'below', 'such', 'other', 'same', 'only', 'own', 'more', 'most', 'some', 'also', 'just', 'even', 'both', 'either', 'neither', 'whether', 'while', 'although', 'because', 'since', 'unless', 'until', 'however', 'therefore', 'thus', 'hence', 'there', 'here', 'now', 'still', 'yet', 'already', 'always', 'never', 'ever', 'often', 'sometimes', 'usually', 'again', 'further', 'once', 'twice',
-                    # Common legal terms (appear in nearly every case)
-                    'action', 'commenced', 'plaintiff', 'defendant', 'appellee', 'appellant', 'court', 'case', 'matter', 'cause', 'suit', 'claim', 'filed', 'brought', 'sued', 'recover', 'damages', 'judgment', 'order', 'decree', 'held', 'found', 'decided', 'ruled', 'affirmed', 'reversed', 'remanded', 'denied', 'granted', 'motion', 'petition', 'complaint', 'answer', 'issue', 'question', 'fact', 'law', 'evidence', 'testimony', 'witness', 'trial', 'hearing', 'proceeding', 'party', 'parties', 'person', 'persons', 'belonging', 'said', 'made', 'given', 'done', 'taken'
-                }
-                
-                # Get more text for keyword extraction (first 300 chars for better coverage)
-                keyword_source = quote_text[:300].lower()
-                # Remove punctuation except numbers
-                keyword_source = re.sub(r'[^\w\s]', ' ', keyword_source)
-                words = keyword_source.split()
-                
-                # Keep distinctive words (not stop words, length > 2)
-                keywords = [w for w in words if w not in stop_words and len(w) > 2]
-                
-                # Take first 10 distinctive keywords
-                keywords = keywords[:10]
+                # Use NER-based extraction (falls back to regex if spaCy unavailable)
+                keywords = extract_keywords_ner(quote_text, max_keywords=10)
                 
                 if keywords:
                     keyword_query = ' '.join(keywords)
