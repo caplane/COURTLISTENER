@@ -225,10 +225,15 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 # Extract distinctive keywords (nouns, numbers, uncommon words)
                 # Remove common words and keep distinctive terms
-                stop_words = {'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or', 'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with', 'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no', 'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when', 'where', 'why', 'how'}
+                stop_words = {
+                    # Common English
+                    'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or', 'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with', 'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no', 'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when', 'where', 'why', 'how', 'out', 'against', 'into', 'upon', 'under', 'over', 'between', 'through', 'during', 'before', 'after', 'above', 'below', 'such', 'other', 'same', 'only', 'own', 'more', 'most', 'some', 'also', 'just', 'even', 'both', 'either', 'neither', 'whether', 'while', 'although', 'because', 'since', 'unless', 'until', 'however', 'therefore', 'thus', 'hence', 'there', 'here', 'now', 'still', 'yet', 'already', 'always', 'never', 'ever', 'often', 'sometimes', 'usually', 'again', 'further', 'once', 'twice',
+                    # Common legal terms (appear in nearly every case)
+                    'action', 'commenced', 'plaintiff', 'defendant', 'appellee', 'appellant', 'court', 'case', 'matter', 'cause', 'suit', 'claim', 'filed', 'brought', 'sued', 'recover', 'damages', 'judgment', 'order', 'decree', 'held', 'found', 'decided', 'ruled', 'affirmed', 'reversed', 'remanded', 'denied', 'granted', 'motion', 'petition', 'complaint', 'answer', 'issue', 'question', 'fact', 'law', 'evidence', 'testimony', 'witness', 'trial', 'hearing', 'proceeding', 'party', 'parties', 'person', 'persons', 'belonging', 'said', 'made', 'given', 'done', 'taken'
+                }
                 
-                # Get more text for keyword extraction (first 150 chars)
-                keyword_source = quote_text[:150].lower()
+                # Get more text for keyword extraction (first 300 chars for better coverage)
+                keyword_source = quote_text[:300].lower()
                 # Remove punctuation except numbers
                 keyword_source = re.sub(r'[^\w\s]', ' ', keyword_source)
                 words = keyword_source.split()
@@ -236,8 +241,8 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 # Keep distinctive words (not stop words, length > 2)
                 keywords = [w for w in words if w not in stop_words and len(w) > 2]
                 
-                # Take first 6-8 distinctive keywords
-                keywords = keywords[:8]
+                # Take first 10 distinctive keywords
+                keywords = keywords[:10]
                 
                 if keywords:
                     keyword_query = ' '.join(keywords)
