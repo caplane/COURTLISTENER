@@ -137,19 +137,22 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
         "Content-Type": "application/json"
     }
     
-    # Extract keywords: truncate at word boundary (max ~150 chars)
-    search_text = quote_text[:150].strip()
-    if len(quote_text) > 150:
-        # Truncate at last space to avoid mid-word cutoff
-        last_space = search_text.rfind(' ')
-        if last_space > 50:  # Only if we keep a reasonable amount
-            search_text = search_text[:last_space]
+    # Extract distinctive phrase: first ~50 chars at word boundary
+    # Short phrases work better for phrase search; full verification happens via 90% match
+    search_text = quote_text[:60].strip()
+    last_space = search_text.rfind(' ')
+    if last_space > 30:  # Keep at least 30 chars
+        search_text = search_text[:last_space]
+    
+    # Strip special characters that may differ in indexed text
+    search_text = re.sub(r'[§¶†‡]', '', search_text)  # Legal symbols
+    search_text = re.sub(r'\s+', ' ', search_text).strip()  # Normalize whitespace
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             search_url = f"{COURTLISTENER_BASE_URL}/search/"
             params = {
-                "q": search_text,  # Keyword search, not exact phrase
+                "q": f'"{search_text}"',  # Exact phrase search (like QuotationGenie)
                 "type": "o",  # Opinions
                 "order_by": "dateFiled asc",  # Oldest first to find original source
                 "page_size": limit
