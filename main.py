@@ -180,7 +180,9 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
             
             for item in data.get("results", [])[:limit]:
                 cluster_id = str(item.get("cluster_id", ""))
-                court_id = item.get("court", "").split("/")[-2] if item.get("court") else ""
+                court_raw = item.get("court", "")
+                court_parts = court_raw.split("/") if court_raw else []
+                court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
                 court_name = COURT_NAME_MAP.get(court_id, court_id)
                 
                 # Get citation
@@ -296,7 +298,9 @@ async def lookup_by_citation(citation: str) -> SearchResult:
             
             item = results[0]
             cluster_id = str(item.get("cluster_id", ""))
-            court_id = item.get("court", "").split("/")[-2] if item.get("court") else ""
+            court_raw = item.get("court", "")
+            court_parts = court_raw.split("/") if court_raw else []
+            court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
             
             return SearchResult(
                 success=True,
