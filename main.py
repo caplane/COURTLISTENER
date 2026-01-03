@@ -151,7 +151,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
             params = {
                 "q": search_text,  # Keyword search, not exact phrase
                 "type": "o",  # Opinions
-                "order_by": "score desc",
+                "order_by": "dateFiled asc",  # Oldest first to find original source
                 "page_size": limit
             }
             
