@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CourtListener Standalone Test App (v1.6 - Error Detection)
-============================================================
+CourtListener Standalone Test App (v1.7 - Trace & Error Display)
+=================================================================
 
 Isolated test environment for debugging CourtListener API integration.
 Deploy on Railway to test independently of QuotationGenie.
@@ -14,6 +14,7 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-04 V1.7: Trace display, returns best matches with error highlighting (like Google Books)
     2026-01-04 V1.6: Error detection with diff highlighting (aligned with Google Books)
     2026-01-04 V1.5: Em-dash splitting (fixes "basin—Seymour" blocking "buspirone")
     2026-01-04 V1.4: Dynamic threshold adjusts for length mismatch
@@ -99,6 +100,12 @@ class SearchResult:
     error: str = ""
     diffs: List[Dict[str, Any]] = field(default_factory=list)  # Diff details as dicts
     verified_quote: str = ""  # User's quote with diffs marked
+
+@dataclass
+class SearchResponse:
+    """Response containing results and trace log."""
+    results: List[SearchResult]
+    trace: List[str] = field(default_factory=list)
 
 # =============================================================================
 # COURT MAPPINGS
@@ -410,7 +417,7 @@ def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: 
 app = FastAPI(
     title="CourtListener Test App",
     description="Standalone test for CourtListener API integration",
-    version="1.6.0"
+    version="1.7.0"
 )
 
 # =============================================================================
@@ -558,25 +565,28 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
     )
 
 
-async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]:
+async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     """
     Search CourtListener for opinions containing quote.
+    Returns SearchResponse with trace and best available results (with error highlighting).
     
     3-phase search strategy:
     1. Distinctive window (200 chars from most distinctive word)
-    2. Fuzzy matching (90% threshold)
-    3. Keyword fallback (50% threshold)
+    2. Fuzzy matching (returns results with diff highlighting)
+    3. Keyword fallback (returns results with diff highlighting)
     """
+    trace = []
     logger.info(f"search_by_quote called with: '{quote_text[:50]}...'")
     logger.info(f"API Key configured: {bool(ACTIVE_API_KEY)} (source: {API_KEY_SOURCE})")
     
     if not ACTIVE_API_KEY:
         logger.error("No API key configured!")
-        return [SearchResult(
+        trace.append("❌ API Key not configured")
+        return SearchResponse(results=[SearchResult(
             success=False, case_name="", citation="", court="",
             date_filed="", snippet="", url="", cluster_id="",
             error="No API key configured. Set COURTLISTENER_API_KEY or CL_API_KEY"
-        )]
+        )], trace=trace)
     
     headers = {
         "Authorization": f"Token {ACTIVE_API_KEY}",
@@ -596,9 +606,13 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
     words = distinctive_q.split()
     short_q = " ".join(words[:15]) if len(words) > 15 else distinctive_q
     
+    trace.append(f"Search window: {distinctive_q[:60]}...")
     logger.info(f"Search window: {distinctive_q[:60]}...")
     
     search_url = f"{COURTLISTENER_BASE_URL}/search/"
+    
+    # Track best results found across all phases (for showing with errors)
+    best_results = []
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -613,6 +627,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
             
             for strategy in exact_strategies:
                 query = f'"{strategy["q"]}"'  # Exact phrase matching
+                trace.append(f"Trying: {strategy['name']}...")
                 logger.info(f"Phase 1 - Trying: {strategy['name']}...")
                 
                 params = {
@@ -626,11 +641,12 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 if response.status_code == 401:
                     logger.error("401 Unauthorized - API key invalid")
-                    return [SearchResult(
+                    trace.append("❌ 401 Unauthorized - Check API key")
+                    return SearchResponse(results=[SearchResult(
                         success=False, case_name="", citation="", court="",
                         date_filed="", snippet="", url="", cluster_id="",
                         error="401 Unauthorized - Check API key"
-                    )]
+                    )], trace=trace)
                 
                 response.raise_for_status()
                 data = response.json()
@@ -638,14 +654,17 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 if items:
                     results = [_parse_search_result(item, quote_text, trusted=True) for item in items[:limit]]
+                    trace.append(f"✅ Found {len(results)} result(s) via exact phrase match")
                     logger.info(f"✅ Phase 1 ({strategy['name']}): Found {len(results)} via exact phrase")
-                    return results
+                    return SearchResponse(results=results, trace=trace)
                 else:
+                    trace.append("❌ 0 results")
                     logger.info(f"❌ Phase 1 ({strategy['name']}): 0 results")
             
             # =================================================================
-            # PHASE 2: Fuzzy strategies (no quotes, 90% threshold)
+            # PHASE 2: Fuzzy strategies (no quotes, show all with diff highlighting)
             # =================================================================
+            trace.append("Exact phrase exhausted, trying fuzzy matching...")
             logger.info("Phase 2 - Trying fuzzy matching...")
             
             fuzzy_strategies = [
@@ -655,6 +674,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
             
             for strategy in fuzzy_strategies:
                 search_query = strategy["q"]  # NO quotes = fuzzy matching
+                trace.append(f"Trying: {strategy['name']}...")
                 logger.info(f"Phase 2 - Trying: {strategy['name']}...")
                 
                 params = {
@@ -671,33 +691,44 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 if items:
                     parsed = [_parse_search_result(item, quote_text, trusted=False) for item in items]
-                    # Filter by DYNAMIC threshold (adjusts for length mismatch)
+                    # Sort by match score descending
+                    parsed.sort(key=lambda r: r.match_score, reverse=True)
+                    
+                    # Check for high-confidence matches
                     quote_len = len(quote_text)
-                    verified = []
+                    high_confidence = []
                     for r in parsed:
                         snippet_len = len(r.snippet) if r.snippet else 0
                         threshold = compute_dynamic_threshold(quote_len, snippet_len)
                         if r.match_score >= threshold:
-                            verified.append(r)
-                            logger.info(f"   ↳ '{r.case_name[:30]}...' score={r.match_score:.2f} >= threshold={threshold:.2f}")
+                            high_confidence.append(r)
+                            trace.append(f"   ↳ '{r.case_name[:30]}...' score={r.match_score:.2f} >= threshold={threshold:.2f}")
                     
-                    if verified:
-                        logger.info(f"✅ Phase 2 ({strategy['name']}): Found {len(verified)} above dynamic threshold")
-                        return verified[:limit]
+                    if high_confidence:
+                        trace.append(f"✅ Found {len(high_confidence)} result(s) above dynamic threshold")
+                        logger.info(f"✅ Phase 2 ({strategy['name']}): Found {len(high_confidence)} above dynamic threshold")
+                        return SearchResponse(results=high_confidence[:limit], trace=trace)
                     else:
+                        # Keep best results for potential display with errors
+                        if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
+                            best_results = parsed[:limit]
+                        trace.append(f"❌ {len(parsed)} results but none above dynamic threshold (best: {parsed[0].match_score:.0%})")
                         logger.info(f"❌ Phase 2 ({strategy['name']}): {len(parsed)} results but none above dynamic threshold")
                 else:
+                    trace.append("❌ 0 results")
                     logger.info(f"❌ Phase 2 ({strategy['name']}): 0 results")
             
             # =================================================================
-            # PHASE 3: Keyword fallback (dynamic threshold, base 50%)
+            # PHASE 3: Keyword fallback
             # =================================================================
+            trace.append("Fuzzy matching exhausted, trying keyword fallback...")
             logger.info("Phase 3 - Trying keyword fallback...")
             
             keywords = extract_keywords_ner(quote_text, max_keywords=10)
             
             if keywords:
                 keyword_query = ' '.join(keywords)
+                trace.append(f"Keywords: {keyword_query}")
                 logger.info(f"Keywords: {keyword_query}")
                 
                 params = {
@@ -714,7 +745,10 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                 
                 if items:
                     parsed = [_parse_search_result(item, quote_text, trusted=False) for item in items]
-                    # Dynamic threshold with lower base for keyword fallback
+                    # Sort by match score descending
+                    parsed.sort(key=lambda r: r.match_score, reverse=True)
+                    
+                    # Check for matches above lower threshold
                     quote_len = len(quote_text)
                     verified = []
                     for r in parsed:
@@ -724,30 +758,47 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
                             verified.append(r)
                     
                     if verified:
+                        trace.append(f"✅ Found {len(verified)} result(s) via keyword fallback")
                         logger.info(f"✅ Phase 3: Found {len(verified)} via keyword fallback")
-                        return verified[:limit]
+                        return SearchResponse(results=verified[:limit], trace=trace)
                     else:
+                        # Keep best results for potential display with errors
+                        if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
+                            best_results = parsed[:limit]
+                        trace.append(f"❌ Keyword results below threshold (best: {parsed[0].match_score:.0%})")
                         logger.info("❌ Phase 3: Keyword results below dynamic threshold")
                 else:
+                    trace.append("❌ 0 keyword results")
                     logger.info("❌ Phase 3: 0 keyword results")
             
+            # =================================================================
+            # Return best available results (with errors highlighted)
+            # =================================================================
+            if best_results:
+                trace.append(f"⚠️ Returning best available matches (may contain errors)")
+                logger.info(f"⚠️ Returning {len(best_results)} best available results with potential errors")
+                return SearchResponse(results=best_results, trace=trace)
+            
+            trace.append("⛔ All strategies exhausted - no results found")
             logger.info("⛔ All phases exhausted - no results found")
-            return []
+            return SearchResponse(results=[], trace=trace)
                 
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
-        return [SearchResult(
+        trace.append(f"❌ HTTP Error: {e.response.status_code}")
+        return SearchResponse(results=[SearchResult(
             success=False, case_name="", citation="", court="",
             date_filed="", snippet="", url="", cluster_id="",
             error=f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-        )]
+        )], trace=trace)
     except Exception as e:
         logger.error(f"Search error: {type(e).__name__}: {e}")
-        return [SearchResult(
+        trace.append(f"❌ Error: {str(e)}")
+        return SearchResponse(results=[SearchResult(
             success=False, case_name="", citation="", court="",
             date_filed="", snippet="", url="", cluster_id="",
             error=str(e)
-        )]
+        )], trace=trace)
 
 
 async def lookup_by_citation(citation: str) -> SearchResult:
@@ -849,7 +900,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>CourtListener Tester v1.6</title>
+        <title>CourtListener Tester v1.7</title>
         <style>
             body {{ font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }}
             .box {{ border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
@@ -877,7 +928,7 @@ async def home():
         </style>
     </head>
     <body>
-        <h1>⚖️ CourtListener Tester v1.6</h1>
+        <h1>⚖️ CourtListener Tester v1.7</h1>
         <p style="color:#666">Legal quote verification with error detection</p>
         
         <div class="status {'ok' if ACTIVE_API_KEY else 'error'}">
@@ -928,7 +979,7 @@ async def home():
                         body: JSON.stringify({{quote: quote, limit: 5}})
                     }}).then(r => r.json());
                     
-                    displayResults(res, quote);
+                    displayResults(res.results, res.trace, quote);
                 }} catch (e) {{
                     out.innerHTML = '<div class="result error"><h3>Error</h3><pre>' + e + '</pre></div>';
                 }}
@@ -948,17 +999,25 @@ async def home():
                         body: JSON.stringify({{citation: citation}})
                     }}).then(r => r.json());
                     
-                    displayResults([res], '');
+                    displayResults([res], [], '');
                 }} catch (e) {{
                     out.innerHTML = '<div class="result error"><h3>Error</h3><pre>' + e + '</pre></div>';
                 }}
             }}
             
-            function displayResults(results, originalQuote) {{
-                let html = '<h3>Results (' + results.length + ')</h3>';
+            function displayResults(results, trace, originalQuote) {{
+                let html = '';
+                
+                // Show trace first (like Google Books)
+                if (trace && trace.length > 0) {{
+                    html += '<h3>Search Trace:</h3>';
+                    html += '<div class="trace">' + trace.join('\\n') + '</div>';
+                }}
+                
+                html += '<h3>Results (' + results.length + ')</h3>';
                 
                 if (results.length === 0) {{
-                    html += '<p>❌ No matches found.</p>';
+                    html += '<p>❌ No matches found after all attempts.</p>';
                 }} else {{
                     results.forEach(r => {{
                         if (r.error) {{
@@ -1024,10 +1083,13 @@ async def home():
     """
 
 @app.post("/search")
-async def search_endpoint(request: SearchRequest) -> List[Dict[str, Any]]:
-    """Search by quote text."""
-    results = await search_by_quote(request.quote, request.limit)
-    return [asdict(r) for r in results]
+async def search_endpoint(request: SearchRequest) -> Dict[str, Any]:
+    """Search by quote text. Returns results and trace."""
+    response = await search_by_quote(request.quote, request.limit)
+    return {
+        "results": [asdict(r) for r in response.results],
+        "trace": response.trace
+    }
 
 @app.post("/citation")
 async def citation_endpoint(request: CitationRequest) -> Dict[str, Any]:
