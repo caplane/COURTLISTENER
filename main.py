@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CourtListener Standalone Test App (v1.7 - Trace & Error Display)
-=================================================================
+CourtListener Standalone Test App (v1.8 - Full Text Verification)
+===================================================================
 
 Isolated test environment for debugging CourtListener API integration.
 Deploy on Railway to test independently of QuotationGenie.
@@ -14,6 +14,7 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-04 V1.8: Full text verification - fetches opinion, extracts ±200 char buffer, catches all errors
     2026-01-04 V1.7.1: Bug fix - always compute diffs even for exact phrase matches
     2026-01-04 V1.7: Trace display, returns best matches with error highlighting (like Google Books)
     2026-01-04 V1.6: Error detection with diff highlighting (aligned with Google Books)
@@ -249,6 +250,162 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     return score, diffs, verified_html
 
 
+# =============================================================================
+# FULL TEXT VERIFICATION (Extended Range)
+# =============================================================================
+
+async def fetch_full_opinion_text(cluster_id: str, client: httpx.AsyncClient, headers: Dict[str, str]) -> Optional[str]:
+    """
+    Fetch full opinion text from CourtListener API.
+    
+    Args:
+        cluster_id: The cluster ID of the opinion
+        client: httpx AsyncClient instance
+        headers: Authorization headers
+        
+    Returns:
+        Full plain text of opinion, or None if fetch fails
+    """
+    if not cluster_id:
+        return None
+    
+    try:
+        # First get the cluster to find the opinion ID
+        cluster_url = f"{COURTLISTENER_BASE_URL}/clusters/{cluster_id}/"
+        resp = await client.get(cluster_url, headers=headers)
+        resp.raise_for_status()
+        cluster_data = resp.json()
+        
+        # Get opinions list from cluster
+        opinions = cluster_data.get("sub_opinions", [])
+        if not opinions:
+            logger.warning(f"No opinions found in cluster {cluster_id}")
+            return None
+        
+        # Fetch the first (main) opinion's full text
+        # Opinion URLs are like "/api/rest/v4/opinions/12345/"
+        opinion_url = opinions[0] if isinstance(opinions[0], str) else opinions[0].get("resource_uri", "")
+        if not opinion_url:
+            return None
+        
+        # Make it absolute if relative
+        if opinion_url.startswith("/"):
+            opinion_url = f"https://www.courtlistener.com{opinion_url}"
+        
+        resp = await client.get(opinion_url, headers=headers)
+        resp.raise_for_status()
+        opinion_data = resp.json()
+        
+        # Try different text fields in order of preference
+        full_text = (
+            opinion_data.get("plain_text") or 
+            opinion_data.get("html_with_citations") or
+            opinion_data.get("html") or
+            opinion_data.get("xml_harvard") or
+            ""
+        )
+        
+        # Strip HTML if present
+        if full_text and ("<" in full_text):
+            full_text = re.sub(r'<[^>]+>', ' ', full_text)
+            full_text = html.unescape(full_text)
+            full_text = ' '.join(full_text.split())
+        
+        logger.info(f"Fetched full text for cluster {cluster_id}: {len(full_text)} chars")
+        return full_text if full_text else None
+        
+    except Exception as e:
+        logger.warning(f"Failed to fetch full opinion text for cluster {cluster_id}: {e}")
+        return None
+
+
+def extract_extended_range(full_text: str, snippet: str, buffer: int = 200) -> Optional[str]:
+    """
+    Find snippet position in full text and extract extended range.
+    
+    Args:
+        full_text: Complete opinion text
+        snippet: The snippet returned by search API
+        buffer: Characters to include before and after snippet
+        
+    Returns:
+        Extended range (buffer + snippet + buffer), or None if snippet not found
+    """
+    if not full_text or not snippet:
+        return None
+    
+    # Clean snippet for matching (remove HTML markup, normalize whitespace)
+    clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+    clean_snippet = html.unescape(clean_snippet)
+    clean_snippet = ' '.join(clean_snippet.split())
+    
+    # Normalize full text similarly
+    clean_full = ' '.join(full_text.split())
+    
+    # Try exact match first
+    pos = clean_full.find(clean_snippet)
+    
+    if pos == -1:
+        # Try fuzzy location using first 50 chars of snippet
+        search_fragment = clean_snippet[:50]
+        pos = clean_full.find(search_fragment)
+        
+    if pos == -1:
+        # Try with SequenceMatcher to find best match location
+        matcher = SequenceMatcher(None, clean_full.lower(), clean_snippet.lower())
+        match = matcher.find_longest_match(0, len(clean_full), 0, len(clean_snippet))
+        if match.size > 20:  # At least 20 chars matching
+            pos = match.a
+        else:
+            logger.warning(f"Could not locate snippet in full text")
+            return None
+    
+    # Extract extended range
+    start = max(0, pos - buffer)
+    end = min(len(clean_full), pos + len(clean_snippet) + buffer)
+    
+    extended = clean_full[start:end]
+    logger.info(f"Extracted extended range: {len(extended)} chars (pos={pos}, buffer={buffer})")
+    
+    return extended
+
+
+def verify_against_full_text(
+    user_quote: str, 
+    snippet: str, 
+    full_text: str, 
+    buffer: int = 200
+) -> tuple:
+    """
+    Verify user quote against extended range from full text.
+    
+    This catches errors that may be outside the original snippet,
+    like "patent" vs "patently" at the start of a quote.
+    
+    Args:
+        user_quote: The user's submitted quotation
+        snippet: Original snippet from search API
+        full_text: Complete opinion text
+        buffer: Characters to include before/after snippet
+        
+    Returns:
+        Same as compute_match_with_diffs: (score, diffs_list, verified_quote_html)
+    """
+    if not full_text:
+        # Fall back to snippet-only comparison
+        return compute_match_with_diffs(user_quote, snippet)
+    
+    # Extract extended range from full text
+    extended_range = extract_extended_range(full_text, snippet, buffer)
+    
+    if not extended_range:
+        # Fall back to snippet-only comparison
+        return compute_match_with_diffs(user_quote, snippet)
+    
+    # Now compare user quote against the extended range
+    return compute_match_with_diffs(user_quote, extended_range)
+
+
 # Stop words for distinctiveness scoring
 STOP_WORDS = {
     'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or',
@@ -418,7 +575,7 @@ def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: 
 app = FastAPI(
     title="CourtListener Test App",
     description="Standalone test for CourtListener API integration",
-    version="1.7.1"
+    version="1.8.0"
 )
 
 # =============================================================================
@@ -521,8 +678,15 @@ def extract_keywords_ner(text: str, max_keywords: int = 10) -> List[str]:
 # CORE FUNCTIONS
 # =============================================================================
 
-def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = False) -> SearchResult:
-    """Parse a CourtListener search result item into SearchResult."""
+def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = False, full_text: str = "") -> SearchResult:
+    """Parse a CourtListener search result item into SearchResult.
+    
+    Args:
+        item: Raw search result from API
+        quote_text: User's submitted quotation
+        trusted: Whether this is from exact phrase match
+        full_text: Optional full opinion text for extended verification
+    """
     cluster_id = str(item.get("cluster_id", ""))
     court_raw = item.get("court", "")
     court_parts = court_raw.split("/") if court_raw else []
@@ -541,9 +705,17 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
     elif item.get("text"):
         snippet = item.get("text", "")[:500]
     
-    # ALWAYS compute diffs to detect errors in user's quote
-    # Even "trusted" exact phrase matches may have typos the API overlooked
-    computed_score, diff_objects, verified_quote = compute_match_with_diffs(quote_text, snippet)
+    # FULL TEXT VERIFICATION: Use extended range if full text available
+    # This catches errors outside the original snippet (e.g., "patent" vs "patently")
+    if full_text:
+        computed_score, diff_objects, verified_quote = verify_against_full_text(
+            quote_text, snippet, full_text, buffer=200
+        )
+        logger.info(f"Full text verification: score={computed_score:.2f}, diffs={len(diff_objects)}")
+    else:
+        # Fall back to snippet-only comparison
+        computed_score, diff_objects, verified_quote = compute_match_with_diffs(quote_text, snippet)
+    
     diffs = [asdict(d) for d in diff_objects]
     
     # For trusted matches (exact phrase found), use 1.0 as base score
@@ -616,6 +788,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     
     # Track best results found across all phases (for showing with errors)
     best_results = []
+    best_items = []  # Raw API items for re-verification with full text
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -656,7 +829,17 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                 items = data.get("results", [])
                 
                 if items:
-                    results = [_parse_search_result(item, quote_text, trusted=True) for item in items[:limit]]
+                    # Fetch full text for verification (use first result's cluster)
+                    trace.append("Fetching full text for verification...")
+                    first_cluster_id = str(items[0].get("cluster_id", ""))
+                    full_text = await fetch_full_opinion_text(first_cluster_id, client, headers)
+                    
+                    if full_text:
+                        trace.append(f"✓ Full text retrieved ({len(full_text)} chars)")
+                    else:
+                        trace.append("⚠ Full text unavailable, using snippet only")
+                    
+                    results = [_parse_search_result(item, quote_text, trusted=True, full_text=full_text or "") for item in items[:limit]]
                     trace.append(f"✅ Found {len(results)} result(s) via exact phrase match")
                     logger.info(f"✅ Phase 1 ({strategy['name']}): Found {len(results)} via exact phrase")
                     return SearchResponse(results=results, trace=trace)
@@ -693,6 +876,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                 items = data.get("results", [])
                 
                 if items:
+                    # First pass: quick scoring without full text
                     parsed = [_parse_search_result(item, quote_text, trusted=False) for item in items]
                     # Sort by match score descending
                     parsed.sort(key=lambda r: r.match_score, reverse=True)
@@ -708,6 +892,20 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                             trace.append(f"   ↳ '{r.case_name[:30]}...' score={r.match_score:.2f} >= threshold={threshold:.2f}")
                     
                     if high_confidence:
+                        # Fetch full text and re-verify the top match
+                        trace.append("Fetching full text for verification...")
+                        top_cluster_id = high_confidence[0].cluster_id
+                        full_text = await fetch_full_opinion_text(top_cluster_id, client, headers)
+                        
+                        if full_text:
+                            trace.append(f"✓ Full text retrieved ({len(full_text)} chars)")
+                            # Re-parse with full text verification
+                            top_item = items[0]  # Re-verify first item
+                            verified_result = _parse_search_result(top_item, quote_text, trusted=False, full_text=full_text)
+                            high_confidence[0] = verified_result
+                        else:
+                            trace.append("⚠ Full text unavailable, using snippet only")
+                        
                         trace.append(f"✅ Found {len(high_confidence)} result(s) above dynamic threshold")
                         logger.info(f"✅ Phase 2 ({strategy['name']}): Found {len(high_confidence)} above dynamic threshold")
                         return SearchResponse(results=high_confidence[:limit], trace=trace)
@@ -715,6 +913,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                         # Keep best results for potential display with errors
                         if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
                             best_results = parsed[:limit]
+                            best_items = items[:limit]  # Save items for later re-verification
                         trace.append(f"❌ {len(parsed)} results but none above dynamic threshold (best: {parsed[0].match_score:.0%})")
                         logger.info(f"❌ Phase 2 ({strategy['name']}): {len(parsed)} results but none above dynamic threshold")
                 else:
@@ -761,6 +960,19 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                             verified.append(r)
                     
                     if verified:
+                        # Fetch full text and re-verify the top match
+                        trace.append("Fetching full text for verification...")
+                        top_cluster_id = verified[0].cluster_id
+                        full_text = await fetch_full_opinion_text(top_cluster_id, client, headers)
+                        
+                        if full_text:
+                            trace.append(f"✓ Full text retrieved ({len(full_text)} chars)")
+                            # Re-parse with full text verification
+                            verified_result = _parse_search_result(items[0], quote_text, trusted=False, full_text=full_text)
+                            verified[0] = verified_result
+                        else:
+                            trace.append("⚠ Full text unavailable, using snippet only")
+                        
                         trace.append(f"✅ Found {len(verified)} result(s) via keyword fallback")
                         logger.info(f"✅ Phase 3: Found {len(verified)} via keyword fallback")
                         return SearchResponse(results=verified[:limit], trace=trace)
@@ -768,6 +980,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                         # Keep best results for potential display with errors
                         if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
                             best_results = parsed[:limit]
+                            best_items = items[:limit]
                         trace.append(f"❌ Keyword results below threshold (best: {parsed[0].match_score:.0%})")
                         logger.info("❌ Phase 3: Keyword results below dynamic threshold")
                 else:
@@ -775,9 +988,25 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                     logger.info("❌ Phase 3: 0 keyword results")
             
             # =================================================================
-            # Return best available results (with errors highlighted)
+            # Return best available results (with full text verification)
             # =================================================================
-            if best_results:
+            if best_results and best_items:
+                trace.append("Fetching full text for best available match...")
+                top_cluster_id = best_results[0].cluster_id
+                full_text = await fetch_full_opinion_text(top_cluster_id, client, headers)
+                
+                if full_text:
+                    trace.append(f"✓ Full text retrieved ({len(full_text)} chars)")
+                    # Re-parse with full text verification
+                    verified_result = _parse_search_result(best_items[0], quote_text, trusted=False, full_text=full_text)
+                    best_results[0] = verified_result
+                else:
+                    trace.append("⚠ Full text unavailable, using snippet only")
+                
+                trace.append(f"⚠️ Returning best available matches (may contain errors)")
+                logger.info(f"⚠️ Returning {len(best_results)} best available results with potential errors")
+                return SearchResponse(results=best_results, trace=trace)
+            elif best_results:
                 trace.append(f"⚠️ Returning best available matches (may contain errors)")
                 logger.info(f"⚠️ Returning {len(best_results)} best available results with potential errors")
                 return SearchResponse(results=best_results, trace=trace)
@@ -903,7 +1132,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>CourtListener Tester v1.7</title>
+        <title>CourtListener Tester v1.8</title>
         <style>
             body {{ font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }}
             .box {{ border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
@@ -931,7 +1160,7 @@ async def home():
         </style>
     </head>
     <body>
-        <h1>⚖️ CourtListener Tester v1.7</h1>
+        <h1>⚖️ CourtListener Tester v1.8</h1>
         <p style="color:#666">Legal quote verification with error detection</p>
         
         <div class="status {'ok' if ACTIVE_API_KEY else 'error'}">
