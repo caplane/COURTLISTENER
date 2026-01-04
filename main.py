@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CourtListener Standalone Test App (v1.8 - Full Text Verification)
-===================================================================
+CourtListener Standalone Test App (v1.9 - Side-by-Side Comparison)
+====================================================================
 
 Isolated test environment for debugging CourtListener API integration.
 Deploy on Railway to test independently of QuotationGenie.
@@ -14,6 +14,7 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-04 V1.9: Side-by-side comparison UI (user quote vs authentic source)
     2026-01-04 V1.8: Full text verification - fetches opinion, extracts ±200 char buffer, catches all errors
     2026-01-04 V1.7.1: Bug fix - always compute diffs even for exact phrase matches
     2026-01-04 V1.7: Trace display, returns best matches with error highlighting (like Google Books)
@@ -102,6 +103,7 @@ class SearchResult:
     error: str = ""
     diffs: List[Dict[str, Any]] = field(default_factory=list)  # Diff details as dicts
     verified_quote: str = ""  # User's quote with diffs marked
+    source_quote: str = ""  # Authentic text from source for side-by-side
 
 @dataclass
 class SearchResponse:
@@ -186,7 +188,7 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     Returns: (score, diffs_list, verified_quote_html)
     """
     if not user_quote or not source_text:
-        return 0.0, [], user_quote
+        return 0.0, [], user_quote, ""
     
     # Strip HTML tags and decode entities from snippet
     clean_source = re.sub(r'<[^>]+>', '', source_text)
@@ -247,7 +249,7 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             ))
             verified_html += f'<span class="diff-missing" title="Missing: {html.escape(source_segment)}">[...]</span>'
     
-    return score, diffs, verified_html
+    return score, diffs, verified_html, source_norm
 
 
 # =============================================================================
@@ -389,7 +391,7 @@ def verify_against_full_text(
         buffer: Characters to include before/after snippet
         
     Returns:
-        Same as compute_match_with_diffs: (score, diffs_list, verified_quote_html)
+        (score, diffs_list, verified_quote_html, source_quote)
     """
     if not full_text:
         # Fall back to snippet-only comparison
@@ -575,7 +577,7 @@ def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: 
 app = FastAPI(
     title="CourtListener Test App",
     description="Standalone test for CourtListener API integration",
-    version="1.8.0"
+    version="1.9.0"
 )
 
 # =============================================================================
@@ -708,13 +710,13 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
     # FULL TEXT VERIFICATION: Use extended range if full text available
     # This catches errors outside the original snippet (e.g., "patent" vs "patently")
     if full_text:
-        computed_score, diff_objects, verified_quote = verify_against_full_text(
+        computed_score, diff_objects, verified_quote, source_quote = verify_against_full_text(
             quote_text, snippet, full_text, buffer=200
         )
         logger.info(f"Full text verification: score={computed_score:.2f}, diffs={len(diff_objects)}")
     else:
         # Fall back to snippet-only comparison
-        computed_score, diff_objects, verified_quote = compute_match_with_diffs(quote_text, snippet)
+        computed_score, diff_objects, verified_quote, source_quote = compute_match_with_diffs(quote_text, snippet)
     
     diffs = [asdict(d) for d in diff_objects]
     
@@ -736,7 +738,8 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
         cluster_id=cluster_id,
         match_score=match_score,
         diffs=diffs,
-        verified_quote=verified_quote
+        verified_quote=verified_quote,
+        source_quote=source_quote
     )
 
 
@@ -1132,7 +1135,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>CourtListener Tester v1.8</title>
+        <title>CourtListener Tester v1.9</title>
         <style>
             body {{ font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }}
             .box {{ border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
@@ -1157,10 +1160,19 @@ async def home():
             .meta {{ color: #666; font-size: 13px; margin: 3px 0; }}
             h2 {{ margin-top: 25px; color: #333; }}
             .quick-tests {{ margin-top: 15px; }}
+            /* Side-by-side comparison */
+            .comparison-container {{ display: flex; gap: 15px; margin: 15px 0; }}
+            .comparison-panel {{ flex: 1; background: #fff; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }}
+            .comparison-header {{ padding: 10px 15px; font-weight: bold; font-size: 14px; border-bottom: 1px solid #ddd; }}
+            .comparison-header.user {{ background: #e3f2fd; color: #1565c0; }}
+            .comparison-header.source {{ background: #e8f5e9; color: #2e7d32; }}
+            .comparison-body {{ padding: 15px; line-height: 1.8; font-size: 14px; max-height: 300px; overflow-y: auto; }}
+            .comparison-body.user .diff-error {{ background-color: #ffeb3b; }}
+            .comparison-body.source {{ color: #333; }}
         </style>
     </head>
     <body>
-        <h1>⚖️ CourtListener Tester v1.8</h1>
+        <h1>⚖️ CourtListener Tester v1.9</h1>
         <p style="color:#666">Legal quote verification with error detection</p>
         
         <div class="status {'ok' if ACTIVE_API_KEY else 'error'}">
@@ -1272,7 +1284,24 @@ async def home():
                         html += '<p class="meta"><strong>Date:</strong> ' + (r.date_filed || 'N/A') + '</p>';
                         html += '<p class="meta"><strong>Match Score:</strong> ' + Math.round((r.match_score || 0) * 100) + '%</p>';
                         
-                        if (r.verified_quote) {{
+                        // Side-by-side comparison
+                        if (r.verified_quote && r.source_quote) {{
+                            html += '<div class="comparison-container">';
+                            
+                            // User's quote (left panel)
+                            html += '<div class="comparison-panel">';
+                            html += '<div class="comparison-header user">📝 Your Quotation</div>';
+                            html += '<div class="comparison-body user">' + r.verified_quote + '</div>';
+                            html += '</div>';
+                            
+                            // Authentic source (right panel)
+                            html += '<div class="comparison-panel">';
+                            html += '<div class="comparison-header source">✓ Authentic Source</div>';
+                            html += '<div class="comparison-body source">' + escapeHtml(r.source_quote) + '</div>';
+                            html += '</div>';
+                            
+                            html += '</div>';
+                        }} else if (r.verified_quote) {{
                             html += '<div style="margin-top:10px"><strong>Your Quotation (' + statusText + '):</strong></div>';
                             html += '<div class="verified-quote">' + r.verified_quote + '</div>';
                         }}
@@ -1283,20 +1312,15 @@ async def home():
                             r.diffs.forEach((d, i) => {{
                                 let desc = '';
                                 if (d.diff_type === 'substitution') {{
-                                    desc = 'You wrote "<b>' + d.user_text + '</b>" → Source has "<b>' + d.source_text + '</b>"';
+                                    desc = 'You wrote "<b>' + escapeHtml(d.user_text) + '</b>" → Source has "<b>' + escapeHtml(d.source_text) + '</b>"';
                                 }} else if (d.diff_type === 'insertion') {{
-                                    desc = '"<b>' + d.user_text + '</b>" not found in source';
+                                    desc = '"<b>' + escapeHtml(d.user_text) + '</b>" not found in source';
                                 }} else if (d.diff_type === 'deletion') {{
-                                    desc = 'Missing from your quote: "<b>' + d.source_text + '</b>"';
+                                    desc = 'Missing from your quote: "<b>' + escapeHtml(d.source_text) + '</b>"';
                                 }}
                                 html += '<div class="error-item">' + (i+1) + '. ' + desc + '</div>';
                             }});
                             html += '</div>';
-                        }}
-                        
-                        if (r.snippet) {{
-                            html += '<div class="snippet-label">Source snippet from CourtListener:</div>';
-                            html += '<div class="snippet-text">"' + r.snippet.substring(0, 300) + '..."</div>';
                         }}
                         
                         if (r.url) {{
@@ -1308,6 +1332,13 @@ async def home():
                 }}
                 
                 document.getElementById('output').innerHTML = html;
+            }}
+            
+            function escapeHtml(text) {{
+                if (!text) return '';
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
             }}
         </script>
     </body>
