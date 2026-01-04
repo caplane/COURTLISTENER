@@ -14,6 +14,7 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-04 V1.7.1: Bug fix - always compute diffs even for exact phrase matches
     2026-01-04 V1.7: Trace display, returns best matches with error highlighting (like Google Books)
     2026-01-04 V1.6: Error detection with diff highlighting (aligned with Google Books)
     2026-01-04 V1.5: Em-dash splitting (fixes "basin—Seymour" blocking "buspirone")
@@ -417,7 +418,7 @@ def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: 
 app = FastAPI(
     title="CourtListener Test App",
     description="Standalone test for CourtListener API integration",
-    version="1.7.0"
+    version="1.7.1"
 )
 
 # =============================================================================
@@ -540,15 +541,17 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
     elif item.get("text"):
         snippet = item.get("text", "")[:500]
     
-    # Compute match score with diff detection
-    if trusted:
+    # ALWAYS compute diffs to detect errors in user's quote
+    # Even "trusted" exact phrase matches may have typos the API overlooked
+    computed_score, diff_objects, verified_quote = compute_match_with_diffs(quote_text, snippet)
+    diffs = [asdict(d) for d in diff_objects]
+    
+    # For trusted matches (exact phrase found), use 1.0 as base score
+    # But if diffs were detected, the score reflects actual similarity
+    if trusted and not diffs:
         match_score = 1.0
-        diffs = []
-        verified_quote = quote_text
     else:
-        match_score, diff_objects, verified_quote = compute_match_with_diffs(quote_text, snippet)
-        # Convert DiffSegment objects to dicts for JSON serialization
-        diffs = [asdict(d) for d in diff_objects]
+        match_score = computed_score
     
     return SearchResult(
         success=True,
