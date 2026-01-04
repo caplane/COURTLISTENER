@@ -12,6 +12,10 @@ Endpoints:
     POST /citation   - Lookup by citation (e.g., "388 U.S. 1")
     GET  /health     - Health check
     GET  /config     - Show configuration status
+
+Version History:
+    2026-01-04 V1.1: CRITICAL FIX - Strip quotation marks from user input
+                     Prevents double-quoting: "quote" -> ""quote"" (broken)
 """
 
 import os
@@ -236,6 +240,10 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
     # Strip special characters that may differ in indexed text
     search_text = re.sub(r'[§¶†‡]', '', search_text)  # Legal symbols
     search_text = re.sub(r'\s+', ' ', search_text).strip()  # Normalize whitespace
+    
+    # CRITICAL: Strip quotation marks - we wrap in our own for phrase search
+    # Without this, user input "quoted text" becomes ""quoted text"" (broken)
+    search_text = search_text.strip('"\'""''«»')
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
