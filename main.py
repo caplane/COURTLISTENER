@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CourtListener Standalone Test App
-=================================
+CourtListener Standalone Test App (v1.3 - Distinctive Word Anchoring)
+======================================================================
 
 Isolated test environment for debugging CourtListener API integration.
 Deploy on Railway to test independently of QuotationGenie.
@@ -14,13 +14,20 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-04 V1.3: Distinctive word anchoring (aligned with google_books.py)
+                     - Search anchored to most distinctive word
+                     - 200-char window from distinctive word position
+    2026-01-04 V1.2: Unicode + Fuzzy Matching
+                     - NFC normalization (preserves §, ¶, accented chars)
+                     - 3-phase search: exact → fuzzy (90%) → keyword (50%)
     2026-01-04 V1.1: CRITICAL FIX - Strip quotation marks from user input
-                     Prevents double-quoting: "quote" -> ""quote"" (broken)
 """
 
 import os
 import re
 import logging
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, asdict
 
@@ -70,6 +77,7 @@ class SearchResult:
     snippet: str
     url: str
     cluster_id: str
+    match_score: float = 0.0  # 0.0 - 1.0 similarity score
     error: str = ""
 
 # =============================================================================
@@ -94,13 +102,153 @@ COURT_NAME_MAP = {
 }
 
 # =============================================================================
+# TEXT CLEANING AND MATCHING (aligned with google_books.py)
+# =============================================================================
+
+MATCH_THRESHOLD = 0.90  # 90% minimum for fuzzy matching
+
+def clean_quote_text(text: str) -> str:
+    """Clean special characters for API acceptance while preserving Unicode symbols."""
+    text = text.strip().strip('"').strip('\u201C').strip('\u201D')
+    text = text.replace('\u2019', "'").replace('\u2018', "'")  # Curly apostrophes
+    text = text.replace('\u201c', '"').replace('\u201d', '"')  # Curly quotes
+    text = text.replace('\u2014', '-').replace('\u2013', '-')  # Dashes to hyphen
+    # Remove double quotes (we wrap in our own for exact phrase search)
+    text = text.replace('"', '')
+    # Normalize Unicode to NFC (preserves §, ¶, accented chars)
+    text = unicodedata.normalize('NFC', text)
+    return ' '.join(text.split())  # Normalize whitespace
+
+
+def compute_match_score(user_quote: str, source_text: str) -> float:
+    """Compute similarity score between user quote and source text."""
+    if not user_quote or not source_text:
+        return 0.0
+    
+    # Normalize for comparison
+    def normalize(t):
+        t = t.lower().strip()
+        t = t.replace('\u2019', "'").replace('\u2018', "'")
+        t = t.replace('\u201c', '"').replace('\u201d', '"')
+        t = t.replace('\u2014', '-').replace('\u2013', '-')
+        # Remove HTML tags if present
+        t = re.sub(r'<[^>]+>', '', t)
+        return ' '.join(t.split())
+    
+    user_norm = normalize(user_quote)
+    source_norm = normalize(source_text)
+    
+    # Check containment first
+    if user_norm in source_norm or source_norm in user_norm:
+        return 1.0
+    
+    return SequenceMatcher(None, user_norm, source_norm).ratio()
+
+
+# Stop words for distinctiveness scoring
+STOP_WORDS = {
+    'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or',
+    'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do',
+    'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must',
+    'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with',
+    'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no',
+    'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when',
+    'where', 'why', 'how', 'out', 'said', 'says', 'told', 'asked', 'replied',
+    # Common legal terms
+    'court', 'case', 'plaintiff', 'defendant', 'action', 'held', 'order',
+    'judgment', 'motion', 'filed', 'claim', 'party', 'parties',
+}
+
+
+def score_word_distinctiveness(word: str) -> int:
+    """
+    Score a word's distinctiveness for search anchor selection.
+    Higher score = more distinctive = better search anchor.
+    """
+    word_lower = word.lower().strip()
+    word_clean = re.sub(r'[^\w]', '', word_lower)
+    
+    if not word_clean or len(word_clean) < 2:
+        return 0
+    
+    if word_lower in STOP_WORDS:
+        return 0
+    
+    # Drug/chemical patterns
+    drug_suffixes = ('pirone', 'prine', 'zepam', 'olan', 'etine', 'amine', 
+                     'azole', 'mycin', 'cillin', 'statin', 'pril', 'sartan',
+                     'olol', 'dipine', 'oxacin', 'cycline', 'dronate')
+    if any(word_lower.endswith(suffix) for suffix in drug_suffixes):
+        return 100
+    
+    # Legal citation symbols
+    if '§' in word or word_lower in ('u.s.', 'm.r.s.', 'f.2d', 'f.3d', 'f.supp'):
+        return 90
+    
+    # Numbers (statute references, years)
+    if re.match(r'^\d+$', word_clean):
+        if len(word_clean) == 4:  # Year
+            return 85
+        return 80
+    
+    # Long words are usually more distinctive
+    if len(word_clean) >= 10:
+        return 70
+    
+    if len(word_clean) >= 7:
+        return 50
+    
+    # Capitalized words (proper nouns)
+    if word and word[0].isupper() and len(word_clean) >= 3:
+        return 40
+    
+    if len(word_clean) >= 3:
+        return 20
+    
+    return 0
+
+
+def extract_distinctive_window(text: str, max_chars: int = 200) -> str:
+    """
+    Extract a search window starting from the most distinctive word.
+    Returns up to max_chars starting from the highest-scoring word's position.
+    """
+    if len(text) <= max_chars:
+        return text
+    
+    # Tokenize while preserving positions
+    words_with_pos = []
+    for match in re.finditer(r'\S+', text):
+        words_with_pos.append((match.group(), match.start(), match.end()))
+    
+    if not words_with_pos:
+        return text[:max_chars]
+    
+    # Score each word
+    best_score = -1
+    best_pos = 0
+    
+    for word, start, end in words_with_pos:
+        score = score_word_distinctiveness(word)
+        if score > best_score:
+            best_score = score
+            best_pos = start
+    
+    # Extract window starting at best position
+    window = text[best_pos:best_pos + max_chars]
+    
+    logging.getLogger(__name__).info(f"Distinctive window: score={best_score}, starts at char {best_pos}: '{window[:50]}...'")
+    
+    return window
+
+# =============================================================================
 # FASTAPI APP
 # =============================================================================
 
 app = FastAPI(
     title="CourtListener Test App",
     description="Standalone test for CourtListener API integration",
-    version="1.0.0"
+    version="1.3.0"
 )
 
 # =============================================================================
@@ -203,25 +351,62 @@ def extract_keywords_ner(text: str, max_keywords: int = 10) -> List[str]:
 # CORE FUNCTIONS
 # =============================================================================
 
-async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]:
-    """Search CourtListener for opinions containing quote."""
-    results = []
+def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = False) -> SearchResult:
+    """Parse a CourtListener search result item into SearchResult."""
+    cluster_id = str(item.get("cluster_id", ""))
+    court_raw = item.get("court", "")
+    court_parts = court_raw.split("/") if court_raw else []
+    court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
+    court_name = COURT_NAME_MAP.get(court_id, court_id)
     
+    # Get citation
+    citation = ""
+    if item.get("citation"):
+        citation = item.get("citation", [""])[0] if isinstance(item.get("citation"), list) else item.get("citation", "")
+    
+    # Get snippet from highlights or text
+    snippet = ""
+    if item.get("snippet"):
+        snippet = item.get("snippet", "")
+    elif item.get("text"):
+        snippet = item.get("text", "")[:500]
+    
+    # Compute match score (trusted = exact phrase match)
+    if trusted:
+        match_score = 1.0
+    else:
+        match_score = compute_match_score(quote_text, snippet)
+    
+    return SearchResult(
+        success=True,
+        case_name=item.get("caseName", item.get("case_name", "")),
+        citation=citation,
+        court=court_name,
+        date_filed=item.get("dateFiled", item.get("date_filed", "")),
+        snippet=snippet,
+        url=f"https://www.courtlistener.com/opinion/{cluster_id}/",
+        cluster_id=cluster_id,
+        match_score=match_score
+    )
+
+
+async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]:
+    """
+    Search CourtListener for opinions containing quote.
+    
+    3-phase search strategy:
+    1. Distinctive window (200 chars from most distinctive word)
+    2. Fuzzy matching (90% threshold)
+    3. Keyword fallback (50% threshold)
+    """
     logger.info(f"search_by_quote called with: '{quote_text[:50]}...'")
     logger.info(f"COURTLISTENER_API_KEY set: {bool(COURTLISTENER_API_KEY)}")
-    logger.info(f"COURTLISTENER_API_KEY length: {len(COURTLISTENER_API_KEY)}")
     
     if not COURTLISTENER_API_KEY:
         logger.error("No API key configured!")
         return [SearchResult(
-            success=False,
-            case_name="",
-            citation="",
-            court="",
-            date_filed="",
-            snippet="",
-            url="",
-            cluster_id="",
+            success=False, case_name="", citation="", court="",
+            date_filed="", snippet="", url="", cluster_id="",
             error="COURTLISTENER_API_KEY not configured"
         )]
     
@@ -230,177 +415,153 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> List[SearchResult]
         "Content-Type": "application/json"
     }
     
-    # Extract distinctive phrase: first ~50 chars at word boundary
-    # Short phrases work better for phrase search; full verification happens via 90% match
-    search_text = quote_text[:60].strip()
-    last_space = search_text.rfind(' ')
-    if last_space > 30:  # Keep at least 30 chars
-        search_text = search_text[:last_space]
+    # Clean quote using NFC normalization (preserves §, ¶)
+    clean_q = clean_quote_text(quote_text)
     
-    # Strip special characters that may differ in indexed text
-    search_text = re.sub(r'[§¶†‡]', '', search_text)  # Legal symbols
-    search_text = re.sub(r'\s+', ' ', search_text).strip()  # Normalize whitespace
+    # Extract 200-char window starting from most distinctive word
+    distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
     
-    # CRITICAL: Strip quotation marks - we wrap in our own for phrase search
-    # Without this, user input "quoted text" becomes ""quoted text"" (broken)
-    search_text = search_text.strip('"\'""''«»')
+    # Also prepare shorter fragment for fallback
+    words = distinctive_q.split()
+    short_q = " ".join(words[:15]) if len(words) > 15 else distinctive_q
+    
+    search_url = f"{COURTLISTENER_BASE_URL}/search/"
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            search_url = f"{COURTLISTENER_BASE_URL}/search/"
-            params = {
-                "q": f'"{search_text}"',  # Exact phrase search (like QuotationGenie)
-                "type": "o",  # Opinions
-                "order_by": "dateFiled asc",  # Oldest first to find original source
-                "page_size": limit
-            }
             
-            logger.info(f"Making request to: {search_url}")
-            logger.info(f"Params: {params}")
+            # =================================================================
+            # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
+            # =================================================================
+            exact_strategies = [
+                {"name": "Distinctive Window", "q": distinctive_q},
+                {"name": "Short Fragment", "q": short_q},
+            ]
             
-            response = await client.get(search_url, headers=headers, params=params)
-            
-            logger.info(f"Response status: {response.status_code}")
-            logger.info(f"Response headers: {dict(response.headers)}")
-            
-            if response.status_code == 401:
-                logger.error("401 Unauthorized - API key invalid or expired")
-                return [SearchResult(
-                    success=False,
-                    case_name="",
-                    citation="",
-                    court="",
-                    date_filed="",
-                    snippet="",
-                    url="",
-                    cluster_id="",
-                    error=f"401 Unauthorized - Check API key"
-                )]
-            
-            response.raise_for_status()
-            data = response.json()
-            
-            logger.info(f"Response keys: {list(data.keys())}")
-            logger.info(f"Result count: {data.get('count', 0)}")
-            
-            for item in data.get("results", [])[:limit]:
-                cluster_id = str(item.get("cluster_id", ""))
-                court_raw = item.get("court", "")
-                court_parts = court_raw.split("/") if court_raw else []
-                court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
-                court_name = COURT_NAME_MAP.get(court_id, court_id)
+            for strategy in exact_strategies:
+                query = f'"{strategy["q"]}"'  # Exact phrase matching
+                logger.info(f"Phase 1 - Trying: {strategy['name']}...")
                 
-                # Get citation
-                citation = ""
-                if item.get("citation"):
-                    citation = item.get("citation", [""])[0] if isinstance(item.get("citation"), list) else item.get("citation", "")
+                params = {
+                    "q": query,
+                    "type": "o",
+                    "order_by": "dateFiled asc",
+                    "page_size": limit
+                }
                 
-                # Get snippet from highlights or text
-                snippet = ""
-                if item.get("snippet"):
-                    snippet = item.get("snippet", "")
-                elif item.get("text"):
-                    snippet = item.get("text", "")[:500]
+                response = await client.get(search_url, headers=headers, params=params)
                 
-                results.append(SearchResult(
-                    success=True,
-                    case_name=item.get("caseName", item.get("case_name", "")),
-                    citation=citation,
-                    court=court_name,
-                    date_filed=item.get("dateFiled", item.get("date_filed", "")),
-                    snippet=snippet,
-                    url=f"https://www.courtlistener.com/opinion/{cluster_id}/",
-                    cluster_id=cluster_id
-                ))
+                if response.status_code == 401:
+                    logger.error("401 Unauthorized - API key invalid")
+                    return [SearchResult(
+                        success=False, case_name="", citation="", court="",
+                        date_filed="", snippet="", url="", cluster_id="",
+                        error="401 Unauthorized - Check API key"
+                    )]
                 
-                logger.info(f"Found: {item.get('caseName', 'Unknown')} - {citation}")
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("results", [])
+                
+                if items:
+                    results = [_parse_search_result(item, quote_text, trusted=True) for item in items[:limit]]
+                    logger.info(f"✅ Phase 1 ({strategy['name']}): Found {len(results)} via exact phrase")
+                    return results
+                else:
+                    logger.info(f"❌ Phase 1 ({strategy['name']}): 0 results")
             
-            # FALLBACK: If phrase search returns 0 results, try keyword search
-            # This handles OCR'd historical documents where exact phrase won't match
-            if not results:
-                logger.info("Phrase search returned 0 results, trying NER-based keyword fallback...")
+            # =================================================================
+            # PHASE 2: Fuzzy strategies (no quotes, 90% threshold)
+            # =================================================================
+            logger.info("Phase 2 - Trying fuzzy matching...")
+            
+            fuzzy_strategies = [
+                {"name": "Fuzzy Distinctive Window", "q": distinctive_q},
+                {"name": "Fuzzy Short Fragment", "q": short_q},
+            ]
+            
+            for strategy in fuzzy_strategies:
+                search_query = strategy["q"]  # NO quotes = fuzzy matching
+                logger.info(f"Phase 2 - Trying: {strategy['name']}...")
                 
-                # Use NER-based extraction (falls back to regex if spaCy unavailable)
-                keywords = extract_keywords_ner(quote_text, max_keywords=10)
+                params = {
+                    "q": search_query,
+                    "type": "o",
+                    "order_by": "dateFiled asc",
+                    "page_size": 20  # Cast wider net
+                }
                 
-                if keywords:
-                    keyword_query = ' '.join(keywords)
-                    logger.info(f"Keyword fallback query: {keyword_query}")
+                response = await client.get(search_url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("results", [])
+                
+                if items:
+                    parsed = [_parse_search_result(item, quote_text, trusted=False) for item in items]
+                    # Filter by 90% threshold
+                    verified = [r for r in parsed if r.match_score >= MATCH_THRESHOLD]
                     
-                    params_fallback = {
-                        "q": keyword_query,  # No quotes = keyword search
-                        "type": "o",
-                        "order_by": "dateFiled asc",
-                        "page_size": 30  # Cast wider net for OCR'd historical docs
-                    }
-                    
-                    response = await client.get(search_url, headers=headers, params=params_fallback)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    logger.info(f"Keyword fallback result count: {data.get('count', 0)}")
-                    
-                    for item in data.get("results", [])[:30]:
-                        cluster_id = str(item.get("cluster_id", ""))
-                        court_raw = item.get("court", "")
-                        court_parts = court_raw.split("/") if court_raw else []
-                        court_id = court_parts[-2] if len(court_parts) >= 2 else (court_parts[0] if court_parts else "")
-                        court_name = COURT_NAME_MAP.get(court_id, court_id)
-                        
-                        citation = ""
-                        if item.get("citation"):
-                            citation = item.get("citation", [""])[0] if isinstance(item.get("citation"), list) else item.get("citation", "")
-                        
-                        snippet = ""
-                        if item.get("snippet"):
-                            snippet = item.get("snippet", "")
-                        elif item.get("text"):
-                            snippet = item.get("text", "")[:500]
-                        
-                        results.append(SearchResult(
-                            success=True,
-                            case_name=item.get("caseName", item.get("case_name", "")),
-                            citation=citation,
-                            court=court_name,
-                            date_filed=item.get("dateFiled", item.get("date_filed", "")),
-                            snippet=snippet,
-                            url=f"https://www.courtlistener.com/opinion/{cluster_id}/",
-                            cluster_id=cluster_id
-                        ))
-                        
-                        logger.info(f"Found (keyword): {item.get('caseName', 'Unknown')} - {citation}")
+                    if verified:
+                        logger.info(f"✅ Phase 2 ({strategy['name']}): Found {len(verified)} above {int(MATCH_THRESHOLD*100)}%")
+                        return verified[:limit]
+                    else:
+                        logger.info(f"❌ Phase 2 ({strategy['name']}): {len(parsed)} results but none above {int(MATCH_THRESHOLD*100)}%")
+                else:
+                    logger.info(f"❌ Phase 2 ({strategy['name']}): 0 results")
             
-            if not results:
-                logger.info("No results found in search (phrase + keyword fallback)")
+            # =================================================================
+            # PHASE 3: Keyword fallback (50% threshold)
+            # =================================================================
+            logger.info("Phase 3 - Trying keyword fallback...")
+            
+            keywords = extract_keywords_ner(quote_text, max_keywords=10)
+            
+            if keywords:
+                keyword_query = ' '.join(keywords)
+                logger.info(f"Keywords: {keyword_query}")
+                
+                params = {
+                    "q": keyword_query,
+                    "type": "o",
+                    "order_by": "dateFiled asc",
+                    "page_size": 30
+                }
+                
+                response = await client.get(search_url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("results", [])
+                
+                if items:
+                    parsed = [_parse_search_result(item, quote_text, trusted=False) for item in items]
+                    # Lower threshold for keyword fallback
+                    verified = [r for r in parsed if r.match_score >= 0.50]
+                    
+                    if verified:
+                        logger.info(f"✅ Phase 3: Found {len(verified)} via keyword fallback")
+                        return verified[:limit]
+                    else:
+                        logger.info("❌ Phase 3: Keyword results below 50% threshold")
+                else:
+                    logger.info("❌ Phase 3: 0 keyword results")
+            
+            logger.info("⛔ All phases exhausted - no results found")
+            return []
                 
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
-        results.append(SearchResult(
-            success=False,
-            case_name="",
-            citation="",
-            court="",
-            date_filed="",
-            snippet="",
-            url="",
-            cluster_id="",
+        return [SearchResult(
+            success=False, case_name="", citation="", court="",
+            date_filed="", snippet="", url="", cluster_id="",
             error=f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-        ))
+        )]
     except Exception as e:
         logger.error(f"Search error: {type(e).__name__}: {e}")
-        results.append(SearchResult(
-            success=False,
-            case_name="",
-            citation="",
-            court="",
-            date_filed="",
-            snippet="",
-            url="",
-            cluster_id="",
+        return [SearchResult(
+            success=False, case_name="", citation="", court="",
+            date_filed="", snippet="", url="", cluster_id="",
             error=str(e)
-        ))
-    
-    return results
+        )]
 
 
 async def lookup_by_citation(citation: str) -> SearchResult:
