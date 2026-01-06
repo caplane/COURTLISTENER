@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CourtListener Standalone Test App (v1.9 - Side-by-Side Comparison)
+CourtListener Standalone Test App (v2.0 - Fixed Verification Logic)
 ====================================================================
 
 Isolated test environment for debugging CourtListener API integration.
@@ -14,6 +14,10 @@ Endpoints:
     GET  /config     - Show configuration status
 
 Version History:
+    2026-01-06 V2.0: FIXED verification logic - find_quote_in_source()
+                     Now locates USER's quote in full text (not snippet position)
+                     Eliminates false "deletion" diffs from buffer regions
+                     Buffer reduced from ±200 to ±50 chars (edge comparison only)
     2026-01-04 V1.9: Side-by-side comparison UI (user quote vs authentic source)
     2026-01-04 V1.8: Full text verification - fetches opinion, extracts ±200 char buffer, catches all errors
     2026-01-04 V1.7.1: Bug fix - always compute diffs even for exact phrase matches
@@ -323,6 +327,8 @@ async def fetch_full_opinion_text(cluster_id: str, client: httpx.AsyncClient, he
 
 def extract_extended_range(full_text: str, snippet: str, buffer: int = 200) -> Optional[str]:
     """
+    DEPRECATED - Use find_quote_in_source() instead.
+    
     Find snippet position in full text and extract extended range.
     
     Args:
@@ -372,23 +378,90 @@ def extract_extended_range(full_text: str, snippet: str, buffer: int = 200) -> O
     return extended
 
 
+def find_quote_in_source(user_quote: str, full_text: str, buffer: int = 50) -> Optional[str]:
+    """
+    Find where user's quote best matches in full text and extract that region.
+    
+    This is the CORRECT approach: find where the USER's quote appears,
+    not where the API snippet appears. This avoids false "deletion" diffs
+    from buffer text the user never intended to quote.
+    
+    Args:
+        user_quote: The user's submitted quotation
+        full_text: Complete source text (opinion, article, etc.)
+        buffer: Small buffer for edge comparison (default 50 chars)
+        
+    Returns:
+        Source excerpt matching user's quote, or None if not found
+    """
+    if not user_quote or not full_text:
+        return None
+    
+    # Normalize both texts for matching
+    def normalize(t):
+        t = re.sub(r'<[^>]+>', ' ', t)  # Strip HTML
+        t = html.unescape(t)
+        t = t.replace('\u2019', "'").replace('\u2018', "'")
+        t = t.replace('\u201c', '"').replace('\u201d', '"')
+        t = t.replace('\u2014', '-').replace('\u2013', '-')
+        t = ' '.join(t.split())  # Normalize whitespace
+        return t
+    
+    clean_quote = normalize(user_quote)
+    clean_source = normalize(full_text)
+    
+    # Strategy 1: Try exact substring match first
+    pos = clean_source.lower().find(clean_quote.lower())
+    if pos != -1:
+        # Found exact match - extract with small buffer
+        start = max(0, pos - buffer)
+        end = min(len(clean_source), pos + len(clean_quote) + buffer)
+        excerpt = clean_source[start:end]
+        logger.info(f"Exact match found at pos={pos}, excerpt={len(excerpt)} chars")
+        return excerpt
+    
+    # Strategy 2: Find best matching region using SequenceMatcher
+    matcher = SequenceMatcher(None, clean_source.lower(), clean_quote.lower())
+    
+    # Find the longest contiguous match
+    match = matcher.find_longest_match(0, len(clean_source), 0, len(clean_quote))
+    
+    if match.size < len(clean_quote) * 0.3:  # Less than 30% matching
+        logger.warning(f"Could not locate quote in source (best match: {match.size} chars)")
+        return None
+    
+    # The match tells us where in source (match.a) corresponds to where in quote (match.b)
+    # We want to extract region that covers the full quote length
+    # Estimate start position: match.a - match.b (where quote would start if aligned)
+    estimated_start = match.a - match.b
+    estimated_start = max(0, estimated_start - buffer)
+    estimated_end = estimated_start + len(clean_quote) + (buffer * 2)
+    estimated_end = min(len(clean_source), estimated_end)
+    
+    excerpt = clean_source[estimated_start:estimated_end]
+    logger.info(f"Fuzzy match: longest_match={match.size} chars, excerpt={len(excerpt)} chars")
+    
+    return excerpt
+
+
 def verify_against_full_text(
     user_quote: str, 
     snippet: str, 
     full_text: str, 
-    buffer: int = 200
+    buffer: int = 50
 ) -> tuple:
     """
-    Verify user quote against extended range from full text.
+    Verify user quote against full text source.
     
-    This catches errors that may be outside the original snippet,
-    like "patent" vs "patently" at the start of a quote.
+    IMPROVED LOGIC: Instead of finding snippet and adding buffer (which causes
+    false deletion errors), we find where the USER's quote matches in the full
+    text and extract just that region for comparison.
     
     Args:
         user_quote: The user's submitted quotation
-        snippet: Original snippet from search API
+        snippet: Original snippet from search API (fallback only)
         full_text: Complete opinion text
-        buffer: Characters to include before/after snippet
+        buffer: Small buffer for edge comparison (default 50 chars)
         
     Returns:
         (score, diffs_list, verified_quote_html, source_quote)
@@ -397,15 +470,16 @@ def verify_against_full_text(
         # Fall back to snippet-only comparison
         return compute_match_with_diffs(user_quote, snippet)
     
-    # Extract extended range from full text
-    extended_range = extract_extended_range(full_text, snippet, buffer)
+    # Find user's quote in full text (the CORRECT approach)
+    source_excerpt = find_quote_in_source(user_quote, full_text, buffer)
     
-    if not extended_range:
-        # Fall back to snippet-only comparison
+    if not source_excerpt:
+        # Couldn't locate in full text - fall back to snippet
+        logger.info("Could not locate quote in full text, using snippet")
         return compute_match_with_diffs(user_quote, snippet)
     
-    # Now compare user quote against the extended range
-    return compute_match_with_diffs(user_quote, extended_range)
+    # Compare user quote against the source excerpt
+    return compute_match_with_diffs(user_quote, source_excerpt)
 
 
 # Stop words for distinctiveness scoring
@@ -711,7 +785,7 @@ def _parse_search_result(item: Dict[str, Any], quote_text: str, trusted: bool = 
     # This catches errors outside the original snippet (e.g., "patent" vs "patently")
     if full_text:
         computed_score, diff_objects, verified_quote, source_quote = verify_against_full_text(
-            quote_text, snippet, full_text, buffer=200
+            quote_text, snippet, full_text, buffer=50
         )
         logger.info(f"Full text verification: score={computed_score:.2f}, diffs={len(diff_objects)}")
     else:
