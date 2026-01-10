@@ -445,12 +445,20 @@ def find_quote_in_source(user_quote: str, full_text: str, buffer: int = 50) -> O
     # We want to extract region that covers the full quote length
     # Estimate start position: block.a - block.b (where quote would start if aligned)
     estimated_start = first_block.a - first_block.b
-    estimated_start = max(0, estimated_start - buffer)
-    estimated_end = estimated_start + len(clean_quote) + (buffer * 2)
+    estimated_start = max(0, estimated_start)
+    estimated_end = estimated_start + len(clean_quote)
     estimated_end = min(len(clean_source), estimated_end)
     
+    # Only add buffer if match quality is LOW (< 80%)
+    # High-quality matches don't need buffer and it causes false "deletion" diffs
+    match_ratio = total_matching / len(clean_quote)
+    if match_ratio < 0.80:
+        # Low quality match - add buffer to help alignment
+        estimated_start = max(0, estimated_start - buffer)
+        estimated_end = min(len(clean_source), estimated_end + buffer)
+    
     excerpt = clean_source[estimated_start:estimated_end]
-    logger.info(f"Fuzzy match: total_matching={total_matching}/{len(clean_quote)} chars, excerpt={len(excerpt)} chars")
+    logger.info(f"Fuzzy match: total_matching={total_matching}/{len(clean_quote)} chars, excerpt={len(excerpt)} chars, ratio={match_ratio:.0%}")
     
     return excerpt
 
@@ -615,20 +623,6 @@ def extract_anchor_window(text: str, window_size: int = 40, min_score: int = 50)
         half_window = window_size // 2
         win_start = max(0, best_start - half_window)
         win_end = min(text_len, best_end + half_window)
-    
-    # Adjust win_start to word boundary (move forward to start of next word)
-    if win_start > 0 and text[win_start] not in ' \t\n' and text[win_start-1] not in ' \t\n':
-        # We're in the middle of a word - find next space
-        space_pos = text.find(' ', win_start)
-        if space_pos != -1 and space_pos < win_end:
-            win_start = space_pos + 1
-    
-    # Adjust win_end to word boundary (move backward to end of previous word)
-    if win_end < text_len and text[win_end-1] not in ' \t\n' and win_end < text_len and text[win_end] not in ' \t\n':
-        # We're in the middle of a word - find previous space
-        space_pos = text.rfind(' ', win_start, win_end)
-        if space_pos != -1:
-            win_end = space_pos
     
     window = text[win_start:win_end].strip()
     
@@ -944,9 +938,8 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     # Split at em-dashes and take segment with most distinctive word
     clean_q = split_at_dashes(clean_q)
     
-    # Extract 60-char window AFTER best anchor for Layer 1 (case identification)
-    # Window is taken from AFTER the anchor to avoid typo-contaminated regions
-    anchor_window = extract_anchor_window(clean_q, window_size=60, min_score=50)
+    # Extract 40-char window around best anchor for Layer 1 (case identification)
+    anchor_window = extract_anchor_window(clean_q, window_size=40, min_score=50)
     
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
@@ -977,9 +970,9 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                 trace.append(f"Phase 0 - Anchor window: {anchor_window[:50]}...")
                 logger.info(f"Phase 0 - Trying anchor window: {anchor_window}")
                 
-                # Exact phrase search with quotes
+                # Search without quotes for fuzzy matching
                 params = {
-                    "q": f'"{anchor_window}"',
+                    "q": anchor_window,
                     "type": "o",
                     "order_by": "score desc",
                     "page_size": 10
