@@ -556,45 +556,71 @@ def score_word_distinctiveness(word: str) -> int:
     return 0
 
 
-def extract_distinctive_anchors(text: str, max_anchors: int = 3, min_score: int = 50) -> List[str]:
+def extract_anchor_window(text: str, window_size: int = 40, min_score: int = 50) -> Optional[str]:
     """
-    Extract the most distinctive words from text for case identification.
+    Extract a character window around the most distinctive word in text.
     
-    Layer 1 of two-layer search: These anchors find the case without
-    being polluted by typos in common words.
+    Layer 1 of two-layer search: Creates a search string anchored to a
+    distinctive word, avoiding typo-prone common words.
+    
+    Window positioning based on anchor location:
+    - First 25% of text:  anchor + chars after
+    - Middle 50% of text: chars before + anchor + chars after (centered)
+    - Last 25% of text:   chars before + anchor
     
     Args:
         text: User's quote text
-        max_anchors: Maximum number of anchors to return (default 3)
+        window_size: Total characters to extract around anchor (default 40)
         min_score: Minimum distinctiveness score to qualify (default 50)
         
     Returns:
-        List of distinctive words/phrases for search query
+        Character window string, or None if no suitable anchor found
     """
-    # Tokenize preserving special patterns
-    words = re.findall(r'§\s*\d+|\d+\s*[A-Z]\.[A-Z]\.[A-Z]\.|\S+', text)
+    if not text or len(text) < 20:
+        return None
     
-    # Score each word
-    scored = []
-    seen = set()
-    for word in words:
-        word_lower = word.lower()
-        if word_lower in seen:
-            continue
-        seen.add(word_lower)
-        
+    # Find all words with positions
+    best_anchor = None
+    best_score = -1
+    best_start = 0
+    best_end = 0
+    
+    for match in re.finditer(r'§\s*\d+|\d+\s*[A-Z]\.[A-Z]\.[A-Z]\.|\S+', text):
+        word = match.group()
         score = score_word_distinctiveness(word)
-        if score >= min_score:
-            scored.append((word, score))
+        if score > best_score and score >= min_score:
+            best_score = score
+            best_anchor = word
+            best_start = match.start()
+            best_end = match.end()
     
-    # Sort by score descending
-    scored.sort(key=lambda x: x[1], reverse=True)
+    if not best_anchor:
+        logger.info("No suitable anchor found (all words below min_score)")
+        return None
     
-    # Return top anchors
-    anchors = [word for word, score in scored[:max_anchors]]
-    logger.info(f"Distinctive anchors: {anchors} (from {len(scored)} candidates)")
+    text_len = len(text)
+    anchor_pos_ratio = best_start / text_len
     
-    return anchors
+    # Determine window boundaries based on anchor position
+    if anchor_pos_ratio < 0.25:
+        # Anchor near start: take anchor + chars after
+        win_start = best_start
+        win_end = min(text_len, best_end + window_size)
+    elif anchor_pos_ratio > 0.75:
+        # Anchor near end: take chars before + anchor
+        win_start = max(0, best_start - window_size)
+        win_end = best_end
+    else:
+        # Anchor in middle: center the window
+        half_window = window_size // 2
+        win_start = max(0, best_start - half_window)
+        win_end = min(text_len, best_end + half_window)
+    
+    window = text[win_start:win_end].strip()
+    
+    logger.info(f"Anchor window: '{best_anchor}' (score={best_score}) at {anchor_pos_ratio:.0%} → '{window[:50]}...'")
+    
+    return window
 
 
 def split_at_dashes(text: str) -> str:
@@ -904,8 +930,8 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     # Split at em-dashes and take segment with most distinctive word
     clean_q = split_at_dashes(clean_q)
     
-    # Extract distinctive anchors for Layer 1 (case identification)
-    anchors = extract_distinctive_anchors(clean_q, max_anchors=3, min_score=50)
+    # Extract 40-char window around best anchor for Layer 1 (case identification)
+    anchor_window = extract_anchor_window(clean_q, window_size=40, min_score=50)
     
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
@@ -927,20 +953,21 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             
             # =================================================================
-            # PHASE 0: Distinctive anchors (case identification - typo resistant)
+            # PHASE 0: Anchor window search (case identification - typo resistant)
             # =================================================================
-            # Layer 1 of two-layer search: Find case using only distinctive
-            # words that are unlikely to contain typos
-            if anchors:
-                anchor_query = " ".join(anchors)
-                trace.append(f"Phase 0 - Anchors: {anchor_query}")
-                logger.info(f"Phase 0 - Trying distinctive anchors: {anchor_query}")
+            # Layer 1 of two-layer search: Search using 40-char window around
+            # the most distinctive word. This avoids typos in common words
+            # while providing enough context to identify the specific case.
+            if anchor_window:
+                trace.append(f"Phase 0 - Anchor window: {anchor_window[:50]}...")
+                logger.info(f"Phase 0 - Trying anchor window: {anchor_window}")
                 
+                # Search without quotes for fuzzy matching
                 params = {
-                    "q": anchor_query,
+                    "q": anchor_window,
                     "type": "o",
                     "order_by": "score desc",
-                    "page_size": 10  # Get more candidates for verification
+                    "page_size": 10
                 }
                 
                 response = await client.get(search_url, headers=headers, params=params)
@@ -995,7 +1022,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                     logger.info("Phase 0 - No candidate passed 80% threshold")
                 else:
                     trace.append("Phase 0 - No candidates found")
-                    logger.info("Phase 0 - 0 results from anchor search")
+                    logger.info("Phase 0 - 0 results from anchor window search")
             
             # =================================================================
             # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
