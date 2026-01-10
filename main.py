@@ -416,9 +416,9 @@ def find_quote_in_source(user_quote: str, full_text: str, buffer: int = 50) -> O
     # Strategy 1: Try exact substring match first
     pos = clean_source.lower().find(clean_quote.lower())
     if pos != -1:
-        # Found exact match - extract with small buffer
-        start = max(0, pos - buffer)
-        end = min(len(clean_source), pos + len(clean_quote) + buffer)
+        # Found exact match - no buffer needed (avoids false diffs from context)
+        start = pos
+        end = pos + len(clean_quote)
         excerpt = clean_source[start:end]
         logger.info(f"Exact match found at pos={pos}, excerpt={len(excerpt)} chars")
         return excerpt
