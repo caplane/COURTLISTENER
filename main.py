@@ -237,16 +237,8 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             ))
             verified_html += f'<span class="diff-error" title="Source: {html.escape(source_segment)}">{html.escape(user_segment)}</span>'
         elif tag == 'insert':
-            # User added text not in source
-            diffs.append(DiffSegment(
-                position=i1,
-                user_text=user_segment,
-                source_text="",
-                diff_type='insertion'
-            ))
-            verified_html += f'<span class="diff-error" title="Not in source">{html.escape(user_segment)}</span>'
-        elif tag == 'delete':
-            # User missing text that's in source
+            # SequenceMatcher 'insert' means: source has text that user is missing
+            # (need to insert source text to make user match)
             diffs.append(DiffSegment(
                 position=i1,
                 user_text="",
@@ -254,6 +246,16 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
                 diff_type='deletion'
             ))
             verified_html += f'<span class="diff-missing" title="Missing: {html.escape(source_segment)}">[...]</span>'
+        elif tag == 'delete':
+            # SequenceMatcher 'delete' means: user has text not in source
+            # (need to delete user text to make it match source)
+            diffs.append(DiffSegment(
+                position=i1,
+                user_text=user_segment,
+                source_text="",
+                diff_type='insertion'
+            ))
+            verified_html += f'<span class="diff-error" title="Not in source">{html.escape(user_segment)}</span>'
     
     return score, diffs, verified_html, source_norm
 
