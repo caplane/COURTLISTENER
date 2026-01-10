@@ -931,7 +931,7 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     clean_q = split_at_dashes(clean_q)
     
     # Extract 40-char window around best anchor for Layer 1 (case identification)
-    anchor_window = extract_anchor_window(clean_q, window_size=40, min_score=50)
+    anchor_window = extract_anchor_window(clean_q, window_size=100, min_score=50)
     
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
