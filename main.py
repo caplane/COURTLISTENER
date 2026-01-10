@@ -183,7 +183,8 @@ def compute_match_score(user_quote: str, source_text: str) -> float:
     if user_norm in source_norm or source_norm in user_norm:
         return 1.0
     
-    return SequenceMatcher(None, user_norm, source_norm).ratio()
+    # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+    return SequenceMatcher(None, user_norm, source_norm, autojunk=False).ratio()
 
 
 def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
@@ -209,7 +210,8 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     source_norm = normalize_for_match(clean_source)
     
     # Use SequenceMatcher to find differences
-    matcher = SequenceMatcher(None, user_norm.lower(), source_norm.lower())
+    # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+    matcher = SequenceMatcher(None, user_norm.lower(), source_norm.lower(), autojunk=False)
     score = matcher.ratio()
     
     diffs = []
@@ -360,7 +362,8 @@ def extract_extended_range(full_text: str, snippet: str, buffer: int = 200) -> O
         
     if pos == -1:
         # Try with SequenceMatcher to find best match location
-        matcher = SequenceMatcher(None, clean_full.lower(), clean_snippet.lower())
+        # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+        matcher = SequenceMatcher(None, clean_full.lower(), clean_snippet.lower(), autojunk=False)
         match = matcher.find_longest_match(0, len(clean_full), 0, len(clean_snippet))
         if match.size > 20:  # At least 20 chars matching
             pos = match.a
@@ -421,25 +424,33 @@ def find_quote_in_source(user_quote: str, full_text: str, buffer: int = 50) -> O
         return excerpt
     
     # Strategy 2: Find best matching region using SequenceMatcher
-    matcher = SequenceMatcher(None, clean_source.lower(), clean_quote.lower())
+    # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+    matcher = SequenceMatcher(None, clean_source.lower(), clean_quote.lower(), autojunk=False)
     
-    # Find the longest contiguous match
-    match = matcher.find_longest_match(0, len(clean_source), 0, len(clean_quote))
+    # Sum ALL matching blocks instead of just longest contiguous match
+    # This handles quotes with small errors that break contiguous alignment
+    matching_blocks = matcher.get_matching_blocks()
+    total_matching = sum(block.size for block in matching_blocks)
     
-    if match.size < len(clean_quote) * 0.3:  # Less than 30% matching
-        logger.warning(f"Could not locate quote in source (best match: {match.size} chars)")
+    if total_matching < len(clean_quote) * 0.5:  # Less than 50% matching
+        logger.warning(f"Could not locate quote in source (best match: {total_matching} chars)")
         return None
     
-    # The match tells us where in source (match.a) corresponds to where in quote (match.b)
+    # Find the first significant block to anchor position
+    first_block = next((b for b in matching_blocks if b.size > 10), matching_blocks[0] if matching_blocks else None)
+    if not first_block:
+        return None
+    
+    # The block tells us where in source (block.a) corresponds to where in quote (block.b)
     # We want to extract region that covers the full quote length
-    # Estimate start position: match.a - match.b (where quote would start if aligned)
-    estimated_start = match.a - match.b
+    # Estimate start position: block.a - block.b (where quote would start if aligned)
+    estimated_start = first_block.a - first_block.b
     estimated_start = max(0, estimated_start - buffer)
     estimated_end = estimated_start + len(clean_quote) + (buffer * 2)
     estimated_end = min(len(clean_source), estimated_end)
     
     excerpt = clean_source[estimated_start:estimated_end]
-    logger.info(f"Fuzzy match: longest_match={match.size} chars, excerpt={len(excerpt)} chars")
+    logger.info(f"Fuzzy match: total_matching={total_matching}/{len(clean_quote)} chars, excerpt={len(excerpt)} chars")
     
     return excerpt
 
