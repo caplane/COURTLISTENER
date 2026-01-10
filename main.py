@@ -446,16 +446,17 @@ def find_quote_in_source(user_quote: str, full_text: str, buffer: int = 50) -> O
     # Estimate start position: block.a - block.b (where quote would start if aligned)
     estimated_start = first_block.a - first_block.b
     estimated_start = max(0, estimated_start)
-    estimated_end = estimated_start + len(clean_quote)
+    # Add small buffer at END to account for characters user may have deleted
+    # (e.g., user wrote "member" but source has "members")
+    estimated_end = estimated_start + len(clean_quote) + 10
     estimated_end = min(len(clean_source), estimated_end)
     
-    # Only add buffer if match quality is LOW (< 80%)
-    # High-quality matches don't need buffer and it causes false "deletion" diffs
+    # Only add START buffer if match quality is LOW (< 80%)
+    # High-quality matches don't need start buffer and it causes false "deletion" diffs
     match_ratio = total_matching / len(clean_quote)
     if match_ratio < 0.80:
-        # Low quality match - add buffer to help alignment
+        # Low quality match - add buffer at start to help alignment
         estimated_start = max(0, estimated_start - buffer)
-        estimated_end = min(len(clean_source), estimated_end + buffer)
     
     excerpt = clean_source[estimated_start:estimated_end]
     logger.info(f"Fuzzy match: total_matching={total_matching}/{len(clean_quote)} chars, excerpt={len(excerpt)} chars, ratio={match_ratio:.0%}")
