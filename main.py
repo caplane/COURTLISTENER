@@ -616,6 +616,20 @@ def extract_anchor_window(text: str, window_size: int = 40, min_score: int = 50)
         win_start = max(0, best_start - half_window)
         win_end = min(text_len, best_end + half_window)
     
+    # Adjust win_start to word boundary (move forward to start of next word)
+    if win_start > 0 and text[win_start] not in ' \t\n' and text[win_start-1] not in ' \t\n':
+        # We're in the middle of a word - find next space
+        space_pos = text.find(' ', win_start)
+        if space_pos != -1 and space_pos < win_end:
+            win_start = space_pos + 1
+    
+    # Adjust win_end to word boundary (move backward to end of previous word)
+    if win_end < text_len and text[win_end-1] not in ' \t\n' and win_end < text_len and text[win_end] not in ' \t\n':
+        # We're in the middle of a word - find previous space
+        space_pos = text.rfind(' ', win_start, win_end)
+        if space_pos != -1:
+            win_end = space_pos
+    
     window = text[win_start:win_end].strip()
     
     logger.info(f"Anchor window: '{best_anchor}' (score={best_score}) at {anchor_pos_ratio:.0%} → '{window[:50]}...'")
