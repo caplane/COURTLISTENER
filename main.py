@@ -556,6 +556,47 @@ def score_word_distinctiveness(word: str) -> int:
     return 0
 
 
+def extract_distinctive_anchors(text: str, max_anchors: int = 3, min_score: int = 50) -> List[str]:
+    """
+    Extract the most distinctive words from text for case identification.
+    
+    Layer 1 of two-layer search: These anchors find the case without
+    being polluted by typos in common words.
+    
+    Args:
+        text: User's quote text
+        max_anchors: Maximum number of anchors to return (default 3)
+        min_score: Minimum distinctiveness score to qualify (default 50)
+        
+    Returns:
+        List of distinctive words/phrases for search query
+    """
+    # Tokenize preserving special patterns
+    words = re.findall(r'§\s*\d+|\d+\s*[A-Z]\.[A-Z]\.[A-Z]\.|\S+', text)
+    
+    # Score each word
+    scored = []
+    seen = set()
+    for word in words:
+        word_lower = word.lower()
+        if word_lower in seen:
+            continue
+        seen.add(word_lower)
+        
+        score = score_word_distinctiveness(word)
+        if score >= min_score:
+            scored.append((word, score))
+    
+    # Sort by score descending
+    scored.sort(key=lambda x: x[1], reverse=True)
+    
+    # Return top anchors
+    anchors = [word for word, score in scored[:max_anchors]]
+    logger.info(f"Distinctive anchors: {anchors} (from {len(scored)} candidates)")
+    
+    return anchors
+
+
 def split_at_dashes(text: str) -> str:
     """
     Split text at em-dashes and return the segment with the most distinctive word.
@@ -833,7 +874,8 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     Search CourtListener for opinions containing quote.
     Returns SearchResponse with trace and best available results (with error highlighting).
     
-    3-phase search strategy:
+    4-phase search strategy:
+    0. Distinctive anchors only (case identification - typo resistant)
     1. Distinctive window (200 chars from most distinctive word)
     2. Fuzzy matching (returns results with diff highlighting)
     3. Keyword fallback (returns results with diff highlighting)
@@ -862,6 +904,9 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     # Split at em-dashes and take segment with most distinctive word
     clean_q = split_at_dashes(clean_q)
     
+    # Extract distinctive anchors for Layer 1 (case identification)
+    anchors = extract_distinctive_anchors(clean_q, max_anchors=3, min_score=50)
+    
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
     
@@ -880,6 +925,77 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            
+            # =================================================================
+            # PHASE 0: Distinctive anchors (case identification - typo resistant)
+            # =================================================================
+            # Layer 1 of two-layer search: Find case using only distinctive
+            # words that are unlikely to contain typos
+            if anchors:
+                anchor_query = " ".join(anchors)
+                trace.append(f"Phase 0 - Anchors: {anchor_query}")
+                logger.info(f"Phase 0 - Trying distinctive anchors: {anchor_query}")
+                
+                params = {
+                    "q": anchor_query,
+                    "type": "o",
+                    "order_by": "score desc",
+                    "page_size": 10  # Get more candidates for verification
+                }
+                
+                response = await client.get(search_url, headers=headers, params=params)
+                
+                if response.status_code == 401:
+                    logger.error("401 Unauthorized - API key invalid")
+                    trace.append("❌ 401 Unauthorized - Check API key")
+                    return SearchResponse(results=[SearchResult(
+                        success=False, case_name="", citation="", court="",
+                        date_filed="", snippet="", url="", cluster_id="",
+                        error="401 Unauthorized - Check API key"
+                    )], trace=trace)
+                
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("results", [])
+                
+                if items:
+                    trace.append(f"Phase 0 - Found {len(items)} candidate(s), verifying...")
+                    logger.info(f"Phase 0 - Found {len(items)} candidates")
+                    
+                    # Try each candidate until we find one containing the quote
+                    for item in items[:5]:  # Check top 5 candidates
+                        cluster_id = str(item.get("cluster_id", ""))
+                        case_name = item.get("caseName", item.get("case_name", ""))[:40]
+                        
+                        full_text = await fetch_full_opinion_text(cluster_id, client, headers)
+                        if not full_text:
+                            continue
+                        
+                        # Layer 2: Verify quote exists in this case using fuzzy match
+                        source_excerpt = find_quote_in_source(clean_q, full_text, buffer=50)
+                        
+                        if source_excerpt:
+                            # Found it! Now do full verification
+                            trace.append(f"✓ Quote found in: {case_name}...")
+                            logger.info(f"Phase 0 - Quote verified in cluster {cluster_id}")
+                            
+                            result = _parse_search_result(item, quote_text, trusted=False, full_text=full_text)
+                            
+                            # Accept if match score >= 80%
+                            if result.match_score >= 0.80:
+                                trace.append(f"✅ Phase 0 verified: {result.match_score:.0%} match")
+                                logger.info(f"✅ Phase 0 success: {result.match_score:.0%} match")
+                                return SearchResponse(results=[result], trace=trace)
+                            else:
+                                trace.append(f"   Score {result.match_score:.0%} < 80%, checking next candidate...")
+                        else:
+                            trace.append(f"   {case_name}... quote not found")
+                    
+                    trace.append("Phase 0 - No candidate passed verification")
+                    logger.info("Phase 0 - No candidate passed 80% threshold")
+                else:
+                    trace.append("Phase 0 - No candidates found")
+                    logger.info("Phase 0 - 0 results from anchor search")
             
             # =================================================================
             # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
