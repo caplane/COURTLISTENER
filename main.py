@@ -930,8 +930,9 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
     # Split at em-dashes and take segment with most distinctive word
     clean_q = split_at_dashes(clean_q)
     
-    # Extract 40-char window around best anchor for Layer 1 (case identification)
-    anchor_window = extract_anchor_window(clean_q, window_size=100, min_score=50)
+    # Extract 60-char window AFTER best anchor for Layer 1 (case identification)
+    # Window is taken from AFTER the anchor to avoid typo-contaminated regions
+    anchor_window = extract_anchor_window(clean_q, window_size=60, min_score=50)
     
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
@@ -962,9 +963,9 @@ async def search_by_quote(quote_text: str, limit: int = 5) -> SearchResponse:
                 trace.append(f"Phase 0 - Anchor window: {anchor_window[:50]}...")
                 logger.info(f"Phase 0 - Trying anchor window: {anchor_window}")
                 
-                # Search without quotes for fuzzy matching
+                # Exact phrase search with quotes
                 params = {
-                    "q": anchor_window,
+                    "q": f'"{anchor_window}"',
                     "type": "o",
                     "order_by": "score desc",
                     "page_size": 10
